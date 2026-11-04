@@ -1,0 +1,23 @@
+[package]
+name = "wgpu-ffx"
+version = "0.1.0"
+edition = "2024"
+authors = ["wgpu-ffx developers", "Advanced Micro Devices, Inc."]
+license = "MIT"
+rust-version = "1.92"
+repository = "https://github.com/cwfitzgerald/wgpu-ffx"
+keywords = ["wgpu", "fsr", "fidelityfx", "upscaling", "graphics"]
+categories = ["graphics", "rendering"]
+description = "AMD FidelityFX FSR 3 Upscaler for wgpu"
+
+[dependencies]
+bitflags = "2"
+bytemuck = { version = "1.14", features = ["derive"] }
+half = { version = "2.7", features = ["bytemuck"] }
+thiserror = "2"
+wgpu = { version = "29", default-features = false, features = ["spirv", "wgsl"] }
+wgpu-ffx-shaders-spv = "=0.1.0"
+
+[dev-dependencies]
+pollster = "0.4"
+wgpu = { version = "29", default-features = false, features = ["vulkan", "metal", "dx12"] }

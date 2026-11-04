@@ -1,0 +1,19 @@
+[package]
+name = "parley"
+version = "0.9.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0 OR MIT"
+publish = false
+description = "Bevy 0.19 compatibility facade enabling Parley complex-script segmentation"
+
+[features]
+default = ["system"]
+std = ["parley_upstream/std"]
+libm = ["parley_upstream/libm"]
+system = ["std", "parley_upstream/system"]
+accesskit = ["parley_upstream/accesskit"]
+
+[dependencies]
+# 0.10首次提供complex-scripts开关；固定精确版本，避免兼容薄层被后续API变更静默替换。
+parley_upstream = { package = "parley", version = "=0.10.0", default-features = false, features = ["complex-scripts"] }

@@ -1,0 +1,4 @@
+# 保持 Bevy 0.19 上游源码格式，避免项目新版 rustfmt 对完整依赖镜像制造无关重排。
+use_field_init_shorthand = true
+newline_style = "Unix"
+style_edition = "2021"
