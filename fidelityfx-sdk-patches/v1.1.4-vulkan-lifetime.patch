@@ -1,0 +1,383 @@
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.cpp
+@@ -760,6 +760,29 @@
+ //////////////////////////////////////////////
+ /// Present
+ //////////////////////////////////////////////
++void publishCpuPresentCompletion(FrameinterpolationPresentInfo* presenter, uint64_t completedFrame) // BL5：调用方已经返回本批次全部queue submit/Present，包括无图像的失败分支。
++{ // BL5：复用SDK调度锁，保持完成计数与通知一致。
++    EnterCriticalSection(&presenter->scheduledFrameCriticalSection); // BL5：此锁仅保护POD调度状态，不跨vkQueuePresent持有。
++    if (completedFrame > presenter->cpuPresentsCompleted) presenter->cpuPresentsCompleted = completedFrame; // BL5：跳过的旧批次由后续完成值覆盖，计数永不倒退。
++    WakeAllConditionVariable(&presenter->cpuPresentCompletion); // BL5：唤醒生命周期等待者，不消耗帧通知事件。
++    LeaveCriticalSection(&presenter->scheduledFrameCriticalSection); // BL5：允许下一批次正常调度。
++} // BL5：不增加GPU信号或虚构实际Present次数。
++
++bool waitForCpuPresentCompletion(FrameinterpolationPresentInfo* presenter, uint64_t targetFrame) // BL5：仅用于已有waitForPresents生命周期边界。
++{ // BL5：先等待CPU的最后Present调用返回，再允许QueueWaitIdle/DeviceWaitIdle。
++    EnterCriticalSection(&presenter->scheduledFrameCriticalSection); // BL5：与发布方使用同一锁，避免丢失唤醒。
++    while (presenter->cpuPresentsCompleted < targetFrame) // BL5：谓词循环覆盖伪唤醒和较旧批次通知。
++    { // BL5：等待时原子释放调度锁，worker仍能取出/完成当前最后一批。
++        if (!SleepConditionVariableCS(&presenter->cpuPresentCompletion, &presenter->scheduledFrameCriticalSection, INFINITE)) // BL5：阻塞只发生在生命周期等待，无轮询/sleep或额外GPU提交。
++        { // BL5：系统等待错误不能冒充完成。
++            LeaveCriticalSection(&presenter->scheduledFrameCriticalSection); // BL5：失败也必须释放已重新取得的锁。
++            return false; // BL5：调用方不进入可能与worker并发的队列idle。
++        } // BL5：正常唤醒后继续核对完成值。
++    } // BL5：目标批次的所有CPU队列调用已返回。
++    LeaveCriticalSection(&presenter->scheduledFrameCriticalSection); // BL5：不将状态锁带入Vulkan阻塞等待。
++    return true; // BL5：没有提前终止worker或丢弃最后一帧。
++} // BL5：公开WaitForPresents仍等待全部已提交呈现工作。
++
+ VkResult presentToSwapChain(FrameinterpolationPresentInfo* pPresenter, uint32_t imageIndex, uint32_t semaphoreIndex = 0)
+ {
+     VkPresentInfoKHR presentInfoKHR   = {};
+@@ -980,7 +1003,7 @@
+                             SubmissionSemaphores toSignal;
+                             SubmissionSemaphores toWait;
+                             toWait.add(presenter->compositionSemaphore, frameInfo.presentIndex);  // composition to finish
+-                            toSignal.add(presenter->frameRenderedSemaphores[imageIndex]);  // frame ready for present. Not a timeline semaphore
++                            // BL5：仅成功 Acquire 才添加 binary signal；失败时没有消费它的 Present。
+ 
+                             // no image was acquired, just skip everything and signal the appropriate semaphores
+ 
+@@ -1001,6 +1024,7 @@
+ 
+                             if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)
+                             {
++                                toSignal.add(presenter->frameRenderedSemaphores[imageIndex]); // BL5：成功 Acquire 对应的 Present 会消费此 binary signal。
+                                 toWait.add(imageAvailableSemaphore);  // swapchain image to be available
+ 
+                                 auto presentCommandList = presenter->commandPool.get(presenter->device, presenter->presentQueue, "presentCommandList");
+@@ -1069,6 +1093,7 @@
+                     }
+ 
+                     numFramesSentForPresentation = entry.numFramesSentForPresentationBase + entry.numFramesToPresent;
++                    publishCpuPresentCompletion(presenter, numFramesSentForPresentation); // BL5：两种presenter均在整批成功/失败分支的最后queue调用返回后兑现CPU完成。
+                 }
+             }
+         }
+@@ -1123,7 +1148,7 @@
+                         if (frameInfo.doPresent)
+                         {
+                             SubmissionSemaphores toSignal;
+-                            toSignal.add(presenter->frameRenderedSemaphores[0]);  // not a timeline semaphore
++                            // BL5：稍后按实际 Acquire 的图像选 semaphore，共用槽零可能仍被上一次 Present 使用。
+ 
+                             // signal replacement buffer availability
+                             // this is the last present of this entry
+@@ -1148,6 +1173,7 @@
+ 
+                             if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)
+                             {
++                                toSignal.add(presenter->frameRenderedSemaphores[realSwapchainImageIndex]); // BL5：按图像复用，仅在成功 Acquire 后 signal。
+                                 toWait.add(acquireSemaphore);
+ 
+                                 res = compositeSwapChainFrame(presenter,
+@@ -1163,7 +1189,7 @@
+                                 waitForPerformanceCount(previousPresentQpc + frameInfo.presentQpcDelta);
+                                 QueryPerformanceCounter(reinterpret_cast<LARGE_INTEGER*>(&previousPresentQpc));
+ 
+-                                res = presentToSwapChain(presenter, realSwapchainImageIndex);
++                                res = presentToSwapChain(presenter, realSwapchainImageIndex, realSwapchainImageIndex); // BL5：等待同一图像对应的 binary semaphore。
+                                 // VK_SUBOPTIMAL_KHR & VK_ERROR_OUT_OF_DATE_KHR: the swapchain has been recreated
+                                 FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR,
+                                                           "presentToSwapChain failed with error %d",
+@@ -1188,6 +1214,7 @@
+                     }
+ 
+                     numFramesSentForPresentation = entry.numFramesSentForPresentationBase + entry.numFramesToPresent;
++                    publishCpuPresentCompletion(presenter, numFramesSentForPresentation); // BL5：两种presenter均在整批成功/失败分支的最后queue调用返回后兑现CPU完成。
+                 }
+             }
+         }
+@@ -1481,12 +1508,7 @@
+     // create non-timeline semaphores
+     semaphoreCreateInfo.pNext = nullptr;
+ 
+-    // semaphores used for present to wait until rendering is over
+-    for (uint32_t i = 0; i < FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT; ++i)
+-    {
+-        res = createSemaphoreFormat(presentInfo.frameRenderedSemaphores[i], "AMD FSR FrameRenderedSemaphore %d", i);
+-        EXIT_ON_VKRESULT_NOT_SUCCESS(res);
+-    }
++    // BL5：frameRenderedSemaphores 在查询真实图像数量后只创建一次；此处提前创建会被覆盖并泄漏。
+     for (uint32_t i = 0; i < FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_ACQUIRE_SEMAPHORE_COUNT; ++i)
+     {
+         res = createSemaphoreFormat(presentInfo.acquireSemaphores[i], "AMD FSR AcquireSemaphore %d", i);
+@@ -1584,6 +1606,8 @@
+     InitializeCriticalSection(&criticalSection);
+     InitializeCriticalSection(&criticalSectionUpdateConfig);
+     InitializeCriticalSection(&presentInfo.scheduledFrameCriticalSection);
++    InitializeConditionVariable(&presentInfo.cpuPresentCompletion); // BL5：每个新交换链独立初始化CPU完成通知，不沿用旧线程状态。
++    presentInfo.cpuPresentsCompleted = 0; // BL5：与新交换链framesSentForPresentation起点一致。
+     InitializeCriticalSection(&presentInfo.swapchainCriticalSection);
+ 
+     presentInfo.presentEvent       = CreateEvent(NULL, FALSE, FALSE, TEXT("PresentEvent"));
+@@ -1727,6 +1751,8 @@
+     if (device == VK_NULL_HANDLE)
+         return;
+ 
++    releaseFrameInterpolationUiComposition(device, pAllocator); // BL5：GPU/线程排空后释放全局 UI 资源，此时被引用的交换链图像仍存活。
++
+     auto destroySemaphore = [device, pAllocator](VkSemaphore& semaphore) {
+         vkDestroySemaphore(device, semaphore, pAllocator);
+         semaphore = VK_NULL_HANDLE;
+@@ -1919,6 +1945,7 @@
+     }
+ 
+     FFX_ASSERT(waitRes);
++    if (framesSentForPresentation > 0 && !waitForCpuPresentCompletion(&presentInfo, framesSentForPresentation)) return false; // BL5：GPU presentSemaphore早于CPU Present返回，必须先取得独立CPU完成证据。
+ 
+     // wait for queue idle too, to make sure all the semaphores are signaled
+     VkResult res = VK_SUCCESS; 
+@@ -2178,8 +2205,7 @@
+     dispatchInterpolationCommands(
+         currentBackBufferIndex, &interpolatedFrame, &realFrame, ToWaitInterpolationQueue);
+ 
+-    EnterCriticalSection(&presentInfo.scheduledFrameCriticalSection);
+-
++    // BL5：外层criticalSection保护资源与计数；不要持调度锁记录/提交合成，驱动阻塞时Presenter仍须能取任务和发布完成。
+     PacingData entry{};
+     entry.presentCallback                  = presentCallback;
+     entry.presentCallbackContext           = presentCallbackContext;
+@@ -2232,6 +2258,7 @@
+         submitCompositionOnGameQueue(entry);
+     }
+ 
++    EnterCriticalSection(&presentInfo.scheduledFrameCriticalSection); // BL5：合成提交已全部返回，调度锁仅保护完整任务发布，不跨任何Vulkan调用。
+     presentInfo.resetTimer              = frameInterpolationResetCondition;
+     presentInfo.scheduledInterpolations = entry;
+     LeaveCriticalSection(&presentInfo.scheduledFrameCriticalSection);
+@@ -2276,6 +2303,7 @@
+ {
+     SubmissionSemaphores semaphoresToSignal;
+     semaphoresToSignal.add(presentInfo.replacementBufferSemaphore, ++framesSentForPresentation);
++    semaphoresToSignal.add(presentInfo.compositionSemaphore, framesSentForPresentation); // BL5：普通合成/透传同样完成该帧；UI注销或换尺寸会等待这个全局帧值。
+     semaphoresToSignal.add(presentInfo.frameRenderedSemaphores[imageIndex]);  // not a timeline semaphore
+ 
+     semaphoresToSignal.add(presentInfo.presentSemaphore, framesSentForPresentation);
+@@ -2513,6 +2541,7 @@
+     presentCallback(&desc, presentCallbackContext);
+ 
+     gameQueueSignal.add(presentInfo.replacementBufferSemaphore, ++framesSentForPresentation);
++    gameQueueSignal.add(presentInfo.compositionSemaphore, framesSentForPresentation); // BL5：预热/reset普通UI帧也必须发布实际合成完成，避免后续clear永久等待不存在的signal。
+ 
+     ImageBarrierHelper presentQueueBarriers;
+     if (presentInfo.presentQueue.familyIndex != presentInfo.gameQueue.familyIndex)
+@@ -2684,10 +2713,14 @@
+         {
+             // no image was acquired. Skip present. Just signal the replacement buffer semaphore for it to be used at a later point
+             gameQueueSignal.add(presentInfo.replacementBufferSemaphore, ++framesSentForPresentation);
++            gameQueueSignal.add(presentInfo.compositionSemaphore, framesSentForPresentation); // BL5：无图像帧没有UI工作，沿现有game等待顺序完成该计数，供UI副本释放。
++            gameQueueSignal.add(presentInfo.presentSemaphore, framesSentForPresentation); // BL5：quiesce按同一计数等待；跳过实际Present也必须兑现完成，不signal任何binary。
++            presentInfo.lastPresentSemaphoreValue = framesSentForPresentation; // BL5：避免恢复插帧时再次signal已完成的相同timeline值。
+             presentInfo.gameQueue.submit(VK_NULL_HANDLE, gameQueueWait, gameQueueSignal);
+         }
+     }
+ 
++    if (!runInterpolation) publishCpuPresentCompletion(&presentInfo, framesSentForPresentation); // BL5：普通成功/失败Acquire均同步完成其queue调用；异步插帧只能由worker发布。
+     previousFrameWasInterpolated = runInterpolation;
+ 
+     replacementSwapBuffers[currentBackBufferIndex].availabilitySemaphoreValue = framesSentForPresentation;
+@@ -2877,8 +2910,7 @@
+             info.arrayLayers       = 1;
+             info.samples           = VK_SAMPLE_COUNT_1_BIT;
+             info.tiling            = VK_IMAGE_TILING_OPTIMAL;
+-            info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+-                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++            info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT; // BL5：内部 UI 副本仅作为复制目标及采样源，SRGB 不支持 STORAGE，不继承场景输出用途。
+             info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+             info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;  // queue family ownership transfer will be handled manually
+ 
+@@ -2891,6 +2923,7 @@
+                               "AMD FSR Ui Doublebuffer Resource",
+                               memProperties,
+                               pAllocator);
++            if (res == VK_SUCCESS) uiReplacementBuffer.description.usage = FFX_RESOURCE_USAGE_READ_ONLY; // BL5：同步修正公开描述，UI 副本不作为 UAV 或颜色附件。
+         }
+     }
+ 
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.cpp
+@@ -51,42 +51,41 @@
+ #define FFX_BACKEND_API_ERROR_ON_VK_ERROR(res) if (res != VK_SUCCESS) return FFX_ERROR_BACKEND_API_ERROR;
+ 
+ 
+-void releaseUiBlitGpuResources(const VkAllocationCallbacks* pAllocator)
+-{
+-    for (uint32_t i = 0; i < _countof(s_uiCompositionDescriptorSets); ++i)
+-    {
+-        vkFreeDescriptorSets(s_uiCompositionDevice, s_uiCompositionDescriptorPool, 1, &s_uiCompositionDescriptorSets[i]);
+-        s_uiCompositionDescriptorSets[i] = VK_NULL_HANDLE;
+-    }
+-
+-    vkDestroyDescriptorPool(s_uiCompositionDevice, s_uiCompositionDescriptorPool, pAllocator);
+-    s_uiCompositionDescriptorPool = VK_NULL_HANDLE;
+-
+-    vkDestroyPipeline(s_uiCompositionDevice, s_uiCompositionPipeline, pAllocator);
+-    s_uiCompositionPipeline = VK_NULL_HANDLE;
+-    vkDestroyPipeline(s_uiCompositionDevice, s_uiCompositionPremulPipeline, pAllocator);
+-    s_uiCompositionPremulPipeline = VK_NULL_HANDLE;
+-
+-    vkDestroyPipelineLayout(s_uiCompositionDevice, s_uiCompositionPipelineLayout, pAllocator);
+-    s_uiCompositionPipelineLayout = VK_NULL_HANDLE;
+-
+-    vkDestroyDescriptorSetLayout(s_uiCompositionDevice, s_uiCompositionDescriptorSetLayout, pAllocator);
+-    s_uiCompositionDescriptorSetLayout = VK_NULL_HANDLE;
+-
+-    vkDestroyRenderPass(s_uiCompositionDevice, s_uiCompositionRenderPass, pAllocator);
+-    s_uiCompositionRenderPass = nullptr;
+-
+-    for (uint32_t i = 0; i < _countof(s_uiCompositionImageViews); ++i)
+-    {
+-        vkDestroyImageView(s_uiCompositionDevice, s_uiCompositionImageViews[i], pAllocator);
+-        s_uiCompositionImageViews[i] = VK_NULL_HANDLE;
+-    }
+-    for (uint32_t i = 0; i < _countof(s_uiCompositionFramebuffers); ++i)
+-    {
+-        vkDestroyFramebuffer(s_uiCompositionDevice, s_uiCompositionFramebuffers[i], pAllocator);
+-        s_uiCompositionFramebuffers[i] = VK_NULL_HANDLE;
+-    }
+-}
++void releaseUiBlitGpuResources(const VkAllocationCallbacks* pAllocator) // BL5：完整释放全局 UI 对象，调用方已排空 GPU 并停止呈现线程。
++{ // BL5：允许重复销毁及部分初始化失败。
++    if (s_uiCompositionDevice == VK_NULL_HANDLE) return; // BL5：没有设备时不能调用 Vulkan 销毁入口。
++    for (auto& framebuffer : s_uiCompositionFramebuffers) // BL5：先释放对附件视图和 render pass 的引用。
++    { // BL5：每个环槽都需要清理。
++        vkDestroyFramebuffer(s_uiCompositionDevice, framebuffer, pAllocator); // BL5：空句柄可安全销毁。
++        framebuffer = VK_NULL_HANDLE; // BL5：resize 后不保留失效句柄。
++    } // BL5：所有附件引用已解除。
++    for (auto& imageView : s_uiCompositionImageViews) // BL5：底层交换链图像在此时仍然存活。
++    { // BL5：释放全部描述符和附件视图。
++        vkDestroyImageView(s_uiCompositionDevice, imageView, pAllocator); // BL5：空句柄可安全销毁。
++        imageView = VK_NULL_HANDLE; // BL5：后续按需重建。
++    } // BL5：UI 不再保留图像视图。
++    vkDestroyDescriptorPool(s_uiCompositionDevice, s_uiCompositionDescriptorPool, pAllocator); // BL5：池销毁隐式释放所有集合，避免逐个释放空集合。
++    s_uiCompositionDescriptorPool = VK_NULL_HANDLE; // BL5：清空所有权。
++    for (auto& descriptorSet : s_uiCompositionDescriptorSets) descriptorSet = VK_NULL_HANDLE; // BL5：池内集合同时失效。
++    vkDestroyPipeline(s_uiCompositionDevice, s_uiCompositionPipeline, pAllocator); // BL5：释放普通透明度管线。
++    s_uiCompositionPipeline = VK_NULL_HANDLE; // BL5：后续按需重建。
++    vkDestroyPipeline(s_uiCompositionDevice, s_uiCompositionPremulPipeline, pAllocator); // BL5：释放预乘透明度管线。
++    s_uiCompositionPremulPipeline = VK_NULL_HANDLE; // BL5：后续按需重建。
++    vkDestroyPipelineLayout(s_uiCompositionDevice, s_uiCompositionPipelineLayout, pAllocator); // BL5：依赖它的管线已释放。
++    s_uiCompositionPipelineLayout = VK_NULL_HANDLE; // BL5：清空所有权。
++    vkDestroyDescriptorSetLayout(s_uiCompositionDevice, s_uiCompositionDescriptorSetLayout, pAllocator); // BL5：描述符池和管线布局均已释放。
++    s_uiCompositionDescriptorSetLayout = VK_NULL_HANDLE; // BL5：清空所有权。
++    vkDestroyRenderPass(s_uiCompositionDevice, s_uiCompositionRenderPass, pAllocator); // BL5：帧缓冲和管线均已释放。
++    s_uiCompositionRenderPass = VK_NULL_HANDLE; // BL5：清空所有权。
++    s_uiCompositionAttachmentFormat = VK_FORMAT_UNDEFINED; // BL5：同设备重建也必须重建 render pass。
++    s_uiCompositionDescriptorSetIndex = 0; // BL5：重置有界描述符环。
++    s_uiCompositionDevice = VK_NULL_HANDLE; // BL5：支持再次调用及新设备初始化。
++} // BL5：全局 UI 对象已全部释放。
++
++void releaseFrameInterpolationUiComposition(VkDevice device, const VkAllocationCallbacks* pAllocator) // BL5：内部入口，不改变导出 ABI。
++{ // BL5：仅清理当前设备的单个活动 UI compositor。
++    if (device == s_uiCompositionDevice) releaseUiBlitGpuResources(pAllocator); // BL5：交换链已完成 waitForPresents 和线程停止。
++} // BL5：不访问宿主私有对象布局。
+ 
+ void DestroyUiCompositionPipeline(VkDevice device, const VkAllocationCallbacks* pAllocator)
+ {
+@@ -159,8 +158,9 @@
+         layoutInfo.flags                      = 0;
+         layoutInfo.setLayoutCount             = 1;
+         layoutInfo.pSetLayouts                = &s_uiCompositionDescriptorSetLayout;
+-        layoutInfo.pushConstantRangeCount     = 0;
+-        layoutInfo.pPushConstantRanges        = nullptr;
++        VkPushConstantRange sdrRange = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(uint32_t)}; // BL5：仅增加内部 SDR 色彩选择，不改变公开 ABI。
++        layoutInfo.pushConstantRangeCount     = 1; // BL5：一个有界四字节开关。
++        layoutInfo.pPushConstantRanges        = &sdrRange; // BL5：普通与预乘管线共用布局。
+ 
+         res = vkCreatePipelineLayout(device, &layoutInfo, pAllocator, &s_uiCompositionPipelineLayout);
+     }
+@@ -242,7 +242,7 @@
+         rasterizationStateCreateInfo.depthBiasConstantFactor                = 0.0f;
+         rasterizationStateCreateInfo.depthBiasClamp                         = 0.0f;
+         rasterizationStateCreateInfo.depthBiasSlopeFactor                   = 0.0f;
+-        rasterizationStateCreateInfo.lineWidth                              = 0.0f;
++        rasterizationStateCreateInfo.lineWidth                              = 1.0f; // BL5：未启用 wideLines 时必须使用标准线宽，填充三角形也需满足该有效性约束。
+ 
+         VkPipelineDepthStencilStateCreateInfo depthStencilStateCreateInfo = {};
+         depthStencilStateCreateInfo.sType                                 = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+@@ -396,10 +396,7 @@
+             // new device
+             releaseUiBlitGpuResources(pAllocator);
+         }
+-        else
+-        {
+-            s_uiCompositionDevice = device;
+-        }
++        s_uiCompositionDevice = device; // BL5：首次初始化与设备替换都必须登记新所有者。
+     }
+ 
+     VkResult res = VK_SUCCESS;
+@@ -727,6 +724,13 @@
+         scissor.extent.width  = renderTargetWidth;
+         scissor.extent.height = renderTargetHeight;
+         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
++        const VkFormat sceneFormat = ffxGetVkFormatFromSurfaceFormat(params->currentBackBuffer.description.format); // BL5：场景以 UNORM 保存 sRGB 编码字节。
++        const VkFormat outputFormat = ffxGetVkFormatFromSurfaceFormat(params->outputSwapChainBuffer.description.format); // BL5：仅在输出仍为相同 UNORM 格式时转换。
++        const VkFormat uiFormat = ffxGetVkFormatFromSurfaceFormat(params->currentUI.description.format); // BL5：SRGB 视图采样已经由硬件解码为线性 UI。
++        const uint32_t decodeEncodedSdr = sceneFormat == outputFormat && // BL5：禁止改变 HDR 或不同通道排列路径。
++            ((sceneFormat == VK_FORMAT_B8G8R8A8_UNORM && uiFormat == VK_FORMAT_B8G8R8A8_SRGB) || // BL5：BGRA8 SDR 的明确配对。
++             (sceneFormat == VK_FORMAT_R8G8B8A8_UNORM && uiFormat == VK_FORMAT_R8G8B8A8_SRGB)); // BL5：RGBA8 SDR 的明确配对。
++        vkCmdPushConstants(commandBuffer, s_uiCompositionPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(decodeEncodedSdr), &decodeEncodedSdr); // BL5：每次绘制显式写入，避免沿用上一帧状态。
+         vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+ 
+         vkCmdEndRenderPass(commandBuffer);
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.h
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_UiComposition.h
+@@ -24,6 +24,8 @@
+ 
+ #include <FidelityFX/host/backends/vk/ffx_vk.h>
+ 
++void releaseFrameInterpolationUiComposition(VkDevice device, const VkAllocationCallbacks* pAllocator); // BL5：呈现/GPU 排空之后、交换链图像销毁之前的内部析构入口。
++
+ VkAccessFlags getVKAccessFlagsFromResourceState(FfxResourceStates state);
+ VkPipelineStageFlags getVKPipelineStageFlagsFromResourceState(FfxResourceStates state);
+ VkImageLayout getVKImageLayoutFromResourceState(FfxResourceStates state);
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainUiCompositionPS.glsl
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainUiCompositionPS.glsl
+@@ -28,16 +28,21 @@
+ layout(set = 0, binding = 1) uniform texture2D r_uiTexture;
+ 
+ layout(location = 0) out vec4 outColor;
++layout(push_constant) uniform Bl5SdrComposition { uint decodeEncodedSdr; } bl5; // BL5：CPP 仅对 UNORM 场景/输出与 SRGB UI 的明确配对启用。
++vec3 bl5SrgbToLinear(vec3 value) { return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)), greaterThan(value, vec3(0.04045))); } // BL5：IEC sRGB 分段解码，仅转换 RGB。
++vec3 bl5LinearToSrgb(vec3 value) { value = max(value, vec3(0.0)); return mix(value * 12.92, 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055, greaterThan(value, vec3(0.0031308))); } // BL5：线性合成后编码回 UNORM 存储。
+ 
+ void main()
+ {
+     vec3 color = texelFetch(r_currBB, ivec2(gl_FragCoord.xy), 0).rgb;
+     vec4 guiColor = texelFetch(r_uiTexture, ivec2(gl_FragCoord.xy), 0);
++    if (bl5.decodeEncodedSdr != 0u) color = bl5SrgbToLinear(color); // BL5：UI 的 SRGB 采样已解码，只需解码场景颜色。
+ 
+ #if FFX_UI_PREMUL
+     outColor = vec4((1.0 - guiColor.a) * color + guiColor.rgb, 1.0); // premul
+ #else
+     outColor = vec4(mix(color, guiColor.rgb, guiColor.a), 1.0); // blend (original)
+ #endif
++    if (bl5.decodeEncodedSdr != 0u) outColor.rgb = bl5LinearToSrgb(outColor.rgb); // BL5：alpha 保持原逻辑；无 UI 的复制分支完全不使用本 shader。
+     
+ }
+\ No newline at end of file
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_DebugPacing.cpp
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK_DebugPacing.cpp
+@@ -214,7 +214,7 @@
+         rasterizationStateCreateInfo.depthBiasConstantFactor                = 0.0f;
+         rasterizationStateCreateInfo.depthBiasClamp                         = 0.0f;
+         rasterizationStateCreateInfo.depthBiasSlopeFactor                   = 0.0f;
+-        rasterizationStateCreateInfo.lineWidth                              = 0.0f;
++        rasterizationStateCreateInfo.lineWidth                              = 1.0f; // BL5：调试 pacing 管线同样必须满足未启用 wideLines 的标准线宽约束。
+ 
+         VkPipelineDepthStencilStateCreateInfo depthStencilStateCreateInfo = {};
+         depthStencilStateCreateInfo.sType                                 = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+--- a/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
++++ b/sdk/src/backends/vk/FrameInterpolationSwapchain/FrameInterpolationSwapchainVK.h
+@@ -195,6 +195,8 @@
+     uint32_t    nextAcquireSemaphoreIndex                                                         = 0;
+ 
+     uint64_t realPresentCount = 0;
++    uint64_t cpuPresentsCompleted = 0; // BL5：已完整返回的CPU呈现批次末帧值，只在scheduledFrameCriticalSection内读取/递增。
++    CONDITION_VARIABLE cpuPresentCompletion = {}; // BL5：GPU信号先于vkQueuePresent返回，CPU完成通知必须独立。
+ 
+     // using win32 threads to set the priorities
+     HANDLE           presenterThreadHandle         = NULL;

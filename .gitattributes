@@ -1,0 +1,2 @@
+# FSR 补丁、清单、许可及说明参与精确 SHA-256 校验，禁止换行转换和 LFS 指针。
+fidelityfx-sdk-patches/** -text -filter
