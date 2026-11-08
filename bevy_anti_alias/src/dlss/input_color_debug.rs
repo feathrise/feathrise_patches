@@ -23,7 +23,7 @@ use bevy_render::{
     },
     renderer::{RenderContext, RenderQueue, ViewQuery},
     view::ViewTarget,
-    RenderStartup,
+    RenderApp, RenderStartup,
 };
 use bevy_utils::default;
 
@@ -34,12 +34,13 @@ use bevy_utils::default;
 /// jitter, guides, history, and the selected performance/quality mode unchanged for an isolated
 /// before/after comparison.
 #[derive(Clone, Copy, Component, ExtractComponent)]
+#[extract_app(RenderApp)]
 #[extract_component_filter(With<Camera>)]
 pub struct DlssRayReconstructionInputColorDebug;
 
 /// Registers extraction while the main application still owns the camera component.
 pub(super) fn build(app: &mut App) {
-    embedded_asset!(app, "input_color_debug.wgsl");
+    embedded_asset!(app, "input_color_debug.wesl");
     app.add_plugins(ExtractComponentPlugin::<DlssRayReconstructionInputColorDebug>::default());
 }
 
@@ -80,9 +81,9 @@ fn init_input_color_debug_pipeline(
         layout: vec![bind_group_layout.clone()],
         vertex: fullscreen_shader.to_vertex_state(),
         fragment: Some(FragmentState {
-            shader: load_embedded_asset!(asset_server.as_ref(), "input_color_debug.wgsl"),
+            shader: load_embedded_asset!(asset_server.as_ref(), "input_color_debug.wesl"),
             targets: vec![Some(ColorTargetState {
-                // `Dlss` requires `Hdr`, whose Bevy 0.19 main target is always RGBA16F.
+                // `Dlss` requires `Hdr`, whose main target is RGBA16F.
                 format: TextureFormat::Rgba16Float,
                 blend: None,
                 write_mask: ColorWrites::ALL,
@@ -135,7 +136,7 @@ pub(super) fn show_input_color(
     ) = view.into_inner();
 
     // Match the RR node's only early return so the alternate texture is known to be its input.
-    if prepass_textures.depth.is_none() || prepass_textures.motion_vectors.is_none() {
+    if prepass_textures.motion_vectors.is_none() {
         return;
     }
     let Some(pipeline) = pipeline_cache.get_render_pipeline(debug_pipeline.pipeline_id) else {

@@ -13,7 +13,7 @@ impl Plugin for ColliderHierarchyPlugin {
     fn build(&self, app: &mut App) {
         // Imsert `ColliderOf` for colliders that are added to a rigid body.
         app.add_observer(
-            |trigger: On<Add, (RigidBody, ColliderMarker)>,
+            |trigger: On<Add<(RigidBody, ColliderMarker)>>,
              mut commands: Commands,
              query: Query<(), With<ColliderMarker>>,
              rb_query: Query<Entity, With<RigidBody>>,
@@ -41,7 +41,7 @@ impl Plugin for ColliderHierarchyPlugin {
 
         // Remove `ColliderOf` when the rigid body or collider is removed.
         app.add_observer(
-            |trigger: On<Remove, (RigidBody, ColliderMarker)>,
+            |trigger: On<Remove<(RigidBody, ColliderMarker)>>,
              mut commands: Commands,
              query: Query<(), With<ColliderMarker>>| {
                 let entity = trigger.entity;
@@ -64,7 +64,7 @@ impl Plugin for ColliderHierarchyPlugin {
 /// Updates [`ColliderOf`] components for colliders when their ancestors change
 /// or when a rigid body is added to the hierarchy.
 fn on_collider_body_changed(
-    trigger: On<Insert, (ChildOf, RigidBody, AncestorMarker<ColliderMarker>)>,
+    trigger: On<Insert<(ChildOf, RigidBody, AncestorMarker<ColliderMarker>)>>,
     mut commands: Commands,
     query: Query<
         Has<ColliderMarker>,
@@ -145,7 +145,7 @@ fn queue_collider_attachment(commands: &mut Commands, collider: Entity, body: En
 
 /// Removes [`ColliderOf`] from colliders when their rigid bodies are removed.
 fn on_body_removed(
-    trigger: On<Remove, RigidBody>,
+    trigger: On<Remove<RigidBody>>,
     mut commands: Commands,
     body_collider_query: Query<&RigidBodyColliders>,
 ) {
@@ -161,5 +161,34 @@ fn on_body_removed(
                 .entity(collider)
                 .try_remove::<(ColliderOf, ColliderTransform)>();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::world::CommandQueue;
+
+    #[test]
+    fn queued_attachment_resolves_the_nearest_body_after_removal() {
+        let mut world = World::new();
+        let root = world.spawn((RigidBody::Static, Transform::default())).id();
+        let leaf = world
+            .spawn((RigidBody::Static, Transform::default(), ChildOf(root)))
+            .id();
+        let collider = world
+            .spawn((ColliderMarker, Transform::default(), ChildOf(leaf)))
+            .id();
+
+        // 模拟旧刚体在层级观察器登记之后、命令真正提交之前被合并。
+        let mut queue = CommandQueue::default();
+        queue_collider_attachment(&mut Commands::new(&mut queue, &world), collider, leaf);
+        world.entity_mut(leaf).remove::<RigidBody>();
+        queue.apply(&mut world);
+
+        assert_eq!(
+            world.get::<ColliderOf>(collider).map(|relation| relation.body),
+            Some(root)
+        );
     }
 }

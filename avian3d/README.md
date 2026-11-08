@@ -1,7 +1,6 @@
 # ![Avian Physics](https://raw.githubusercontent.com/Jondolf/avian/avian/assets/branding/logo.svg)
 
 [![MIT/Apache 2.0](https://img.shields.io/badge/license-MIT%2FApache-blue.svg)](https://github.com/avianphysics/avian#license)
-[![ci](https://github.com/avianphysics/avian/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/avianphysics/avian/actions/workflows/ci.yml)
 [![2D crates.io](https://img.shields.io/crates/v/avian2d?label=2D%20crates.io)](https://crates.io/crates/avian2d)
 [![2D docs.rs](https://img.shields.io/docsrs/avian2d?label=2D%20docs.rs)](https://docs.rs/avian2d)
 [![3D crates.io](https://img.shields.io/crates/v/avian3d?label=3D%20crates.io)](https://crates.io/crates/avian3d)
@@ -74,11 +73,11 @@ First, add `avian2d` or `avian3d` to your dependencies in `Cargo.toml`:
 ```toml
 # For 2D applications:
 [dependencies]
-avian2d = "0.7"
+avian2d = "0.8"
 
 # For 3D applications:
 [dependencies]
-avian3d = "0.7"
+avian3d = "0.8"
 
 # If you want to use the most up-to-date version, you can follow the main branch:
 [dependencies]
@@ -146,7 +145,7 @@ fn setup(
 
 You can find lots of 2D and 3D examples in [/crates/avian2d/examples](/crates/avian2d/examples) and [/crates/avian3d/examples](/crates/avian3d/examples) respectively.
 
-The examples support both `f32` and `f64` precisions, so the code contains some feature-dependent types like `Scalar` and `Vector`.
+The examples support both `f32` and `f64` precisions, so the code contains some feature-dependent types like `Real` and `RVector`.
 In actual usage these are not needed, so you can just use `f32` or `f64` types depending on the features you have chosen.
 
 By default the examples use `f32`. To run the `f64` versions, you need to disable default features and manually choose the dimension
@@ -161,6 +160,7 @@ cargo run --example cubes --no-default-features --features "3d f64 parry-f64"
 
 | Bevy | Avian   |
 | ---- | ------- |
+| 0.20 | 0.8     |
 | 0.19 | 0.7     |
 | 0.18 | 0.5-0.6 |
 | 0.17 | 0.4     |
@@ -187,9 +187,14 @@ Avian provides [migration guides](./migration-guides) for each version.
 
 If you encounter any problems, feel free to open issues or create pull requests.
 For larger changes and additions, it's better to open an issue or ask me for input
-before making a pull request.
+before making a pull request. Make sure to review our [AI policy](/AI_POLICY.md)
+before contributing.
 
-You can also ask for help or ask questions on the [Bevy Discord](https://discord.com/invite/gMUk5Ph)
+We also have our own [Avian Dev Discord](https://discord.gg/nE5xt4JdPx) server
+for development discussions related to Avian or other physics topics. Hop in
+if you want to chat or follow along!
+
+For other guidance or questions, consider joining us on the [Bevy Discord](https://discord.com/invite/gMUk5Ph)
 server's Avian Physics topic in `#ecosystem-crates`. My username on the Discord is `Jondolf` (`@jondolfdev`).
 
 ## Acknowledgements

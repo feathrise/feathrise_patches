@@ -7,6 +7,8 @@ use crate::{
 
 use wgpu_ffx_shaders_spv::fsr3upscaler::Shaders;
 
+const FSR_ENTRY_POINT: &str = "main";
+
 pub(crate) struct FsrPass {
     kind: FsrPassKind,
     pipeline: wgpu::ComputePipeline,
@@ -27,7 +29,11 @@ impl FsrPass {
             unsafe {
                 device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
                     label: Some(kind.label()),
-                    num_workgroups: (0, 0, 0),
+                    // WGPU 30 校验入口名；这里只传 SPIR-V，工作组尺寸仍由着色器决定。
+                    entry_points: Cow::Borrowed(&[wgpu::PassthroughShaderEntryPoint {
+                        name: Cow::Borrowed(FSR_ENTRY_POINT),
+                        workgroup_size: (0, 0, 0),
+                    }]),
                     spirv: Some(Cow::Borrowed(bytemuck::cast_slice(kind.shader(shaders)))),
                     dxil: None,
                     msl: None,
@@ -69,7 +75,7 @@ impl FsrPass {
             label: Some(kind.label()),
             layout: Some(&pipeline_layout),
             module: &shader_module,
-            entry_point: Some("main"),
+            entry_point: Some(FSR_ENTRY_POINT),
             compilation_options: Default::default(),
             cache: None,
         });

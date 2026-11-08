@@ -3,8 +3,8 @@
 avian3d = { path = "avian3d" }
 bevy_anti_alias = { path = "bevy_anti_alias" }
 bevy_core_pipeline = { path = "bevy_core_pipeline" }
+bevy_extract = { path = "bevy_extract" }
 bevy_render = { path = "bevy_render" }
 dlss_wgpu = { path = "dlss_wgpu" }
-parley = { path = "parley-compat" }
 wgpu-ffx = { path = "wgpu-ffx" }
 wgpu-hal = { path = "wgpu-hal" }

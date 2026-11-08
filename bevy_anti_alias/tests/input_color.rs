@@ -3,9 +3,9 @@
 #[test]
 fn input_color_debug_shader_is_valid_wgsl() {
     let shader =
-        include_str!("../src/dlss/input_color_debug.wgsl"); // 直接读取补丁包嵌入的生产 Shader，避免测试复制另一份实现。
+        include_str!("../src/dlss/input_color_debug.wesl"); // 直接读取补丁包嵌入的生产 Shader，避免测试复制另一份实现。
     let validation_source = shader.replacen(
-        "#import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput",
+        "import bevy_core_pipeline::fullscreen_vertex_shader::FullscreenVertexOutput;",
         "struct FullscreenVertexOutput { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, };",
         1,
     ); // naga不处理Bevy预处理指令，测试只以内联等价接口替换这一条正式import。

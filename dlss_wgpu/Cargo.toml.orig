@@ -1,6 +1,6 @@
 [package]
 name = "dlss_wgpu"
-version = "4.0.0"
+version = "6.0.0"
 edition = "2024"
 categories = ["graphics", "rendering"]
 description = "Adds support for using DLSS with wgpu"
@@ -9,14 +9,14 @@ documentation = "https://docs.rs/dlss_wgpu"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-wgpu = { version = "29", default-features = false, features = ["vulkan"] }
+wgpu = { version = "30", default-features = false, features = ["vulkan"] }
 ash = "0.38"
 uuid = "1"
 bitflags = "2"
 thiserror = "2"
 
 [build-dependencies]
-bindgen = "0.72"
+bindgen = { version = "0.73", default-features = false, features = ["logging", "runtime"] }
 cc = "1"
 
 [features]

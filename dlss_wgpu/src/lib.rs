@@ -65,6 +65,7 @@ mod sdk;
 mod lifecycle;
 #[cfg(not(feature = "mock"))] // 外部管理器必须在成功初始化后显式接管。
 pub use lifecycle::register_external_ngx_shutdown_owner;
+#[cfg(not(feature = "mock"))]
 pub use lifecycle::{DeferredNgxShutdownResult, shutdown_deferred_ngx_devices}; // 共享管理器在SL插件全部释放后关闭宿主NGX loader。
 
 /// DLSS Ray Reconstruction.

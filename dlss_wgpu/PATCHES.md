@@ -1,6 +1,6 @@
 # 本地补丁记录
 
-本目录完整镜像 crates.io 的 `dlss_wgpu 4.0.0`，继续对应 NVIDIA DLSS SDK `310.5.3` 与 `wgpu 29`。
+本目录以 crates.io 的 `dlss_wgpu 6.0.0` 为基线，对应 NVIDIA DLSS SDK `310.9.1` 与 `wgpu 30`。
 
 ## Super Resolution 固定路径使用最佳内部尺寸
 
@@ -22,16 +22,16 @@ SDK 310.5.3 会在 SR/RR 求值内部以 `vkCmdClearColorImage` 清空输出，�
 
 本地补丁由`build.rs`在Cargo私有`OUT_DIR/dlss_runtime`中只复制`nvngx_dlss.dll`与`nvngx_dlssd.dll`，并清除该生成目录内其他`nvngx_*`残留。运行时优先采用可执行文件同目录的精确两项白名单，普通`cargo run`回退构建期隔离目录；两者都拒绝包含Frame Generation或其他额外NGX运行库的目录，不再读取运行时`DLSS_SDK`环境变量。正式发行仍由`xtask`复制并审计相同两项DLL。
 
-## Ray Reconstruction 禁用 AutoExposure 创建标志
+## Ray Reconstruction 创建标志
 
-NVIDIA《DLSS-RR Integration Guide》3.7 明确说明曝光、自动曝光和锐化不受 Ray Reconstruction 支持；但 Bevy 0.19 的通用 DLSS 准备系统会同时为 Super Resolution 与 Ray Reconstruction 传入 `DlssFeatureFlags::AutoExposure`。
+Bevy 0.20.1 在 RR 构造前去除 `AutoExposure`，dlss_wgpu 6.0.0 会拒绝带该标志的 RR 构造请求。升级后由这两处上游逻辑共同遵循 RR 的创建契约，Super Resolution 仍可使用自动曝光。
 
-本地补丁仅在 `DlssRayReconstruction::new` 内移除该位，并保留低分辨率运动矢量、反向深度和 HDR 等其他创建标志。`DlssSuperResolution::new` 不受影响。
+## NGX 绑定构建
 
-该补丁只用于遵守 RR 的创建标志契约。用户实机已确认单独移除此位仍会发白，因此不得把它记录为本次白光根因；纯逻辑单元测试只锁定移除 `AutoExposure` 的边界。
+绑定生成保留 Clang 动态加载与构建日志。生成的 Rust 绑定由编译器直接读取，关闭可选格式化，避免 `bindgen` 和 `prettyplease` 从不同的 `syn` 主版本传递语法树。
 
 ## 已撤销：Ray Reconstruction 真实帧间隔 A/B
 
 曾把可选研究输入 `InFrameTimeDeltaInMsec` 从上游允许的 `0.0` 改为相邻成功求值的真实毫秒间隔。用户在 RTX/Vulkan 实机确认该实验会让杂粮明显发黑，同时等待后白光仍继续扩散，因此它既引入画质回归也没有解决原缺陷。
 
-当前源码已完整恢复 `dlss_wgpu 4.0.0` 的固定 `0.0` 行为，并移除上下文计时状态、钳制逻辑及其测试；不得在没有新证据时重新引入。
+当前源码采用上游的固定 `0.0` 输入，延续此前撤销计时实验后的行为。

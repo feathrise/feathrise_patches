@@ -42,6 +42,15 @@ pub struct DeferredNgxShutdownResult { // 不向调用者暴露静态链接绑�
     pub succeeded: bool, // 使用NGX自身成功判定，避免调用者误用Streamline返回码。
 } // 可审计关闭结果结束。
 
+impl DeferredNgxShutdownResult {
+    /// Streamline 可以先关闭同设备的共享 NGX，宿主随后会收到未初始化状态。
+    pub fn already_inactive(&self) -> bool {
+        use crate::nvsdk_ngx::NVSDK_NGX_Result_NVSDK_NGX_Result_FAIL_NotInitialized;
+
+        self.result == NVSDK_NGX_Result_NVSDK_NGX_Result_FAIL_NotInitialized as u32
+    }
+}
+
 /// 在外部管理器及其全部NGX插件关闭后，释放宿主独立静态链接loader的设备状态。
 ///
 /// # Safety

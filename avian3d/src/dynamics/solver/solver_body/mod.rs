@@ -6,17 +6,21 @@
 //!
 //! - [`SolverBody`]: The body state used by the solver.
 //! - [`SolverBodyInertia`]: The inertial properties of a body used by the solver.
+//! - [`SolverBodyIndex`]: A component storing the index of a body in the [`SolverBodies`] resource.
+//! - [`SolverBodies`]: A resource storing [`SolverBody`]s contiguously for awake, active bodies.
 
 mod plugin;
 
 pub use plugin::SolverBodyPlugin;
 
+use core::marker::PhantomData;
+
 use bevy::prelude::*;
 
-use super::{Rotation, Vector};
-use crate::{SymmetricTensor, math::Scalar, prelude::LockedAxes};
+use super::Rot;
 #[cfg(feature = "3d")]
-use crate::{math::Quaternion, prelude::ComputedAngularInertia};
+use crate::prelude::ComputedAngularInertia;
+use crate::{SymmetricTensor, math::Vector, prelude::LockedAxes};
 
 // The `SolverBody` layout is inspired by `b2BodyState` in Box2D v3.
 
@@ -24,8 +28,9 @@ use crate::{math::Quaternion, prelude::ComputedAngularInertia};
 /// designed to improve memory locality and performance.
 ///
 /// Only awake dynamic bodies and kinematic bodies have an associated solver body,
-/// stored as a component on the body entity. Static bodies and sleeping dynamic bodies
-/// do not move, so they instead use a "dummy state" with [`SolverBody::default()`].
+/// stored contiguously in the [`SolverBodies`] resource and indexed by a [`SolverBodyIndex`]
+/// component on the body entity. Static bodies and sleeping dynamic bodies do not move,
+/// so they instead use a "dummy state" with [`SolverBody::default()`].
 ///
 /// # Representation
 ///
@@ -46,44 +51,44 @@ use crate::{math::Quaternion, prelude::ComputedAngularInertia};
 ///   quite confusing and error-prone, and would possibly require more branching.
 ///
 /// In addition to the delta position and rotation, we also store the linear and angular velocities
-/// and some bitflags. This all fits in 32 bytes in 2D or 56 bytes in 3D with the `f32` feature.
+/// and some bitflags. This all fits in 32 bytes in 2D or 56 bytes in 3D.
 ///
 /// The 2D data layout has been designed to support fast conversion to and from
 /// wide SIMD types via scatter/gather operations in the future when SIMD optimizations
 /// are implemented.
 // TODO: Is there a better layout for 3D?
-#[derive(Component, Clone, Debug, Default, Reflect)]
+#[derive(Clone, Debug, Default, Reflect)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
-#[reflect(Component, Debug)]
+#[reflect(Debug)]
 pub struct SolverBody {
     /// The linear velocity of the body.
     ///
-    /// 8 bytes in 2D and 12 bytes in 3D with the `f32` feature.
+    /// 8 bytes in 2D and 12 bytes in 3D.
     pub linear_velocity: Vector,
     /// The angular velocity of the body.
     ///
-    /// 4 bytes in 2D and 12 bytes in 3D with the `f32` feature.
+    /// 4 bytes in 2D and 12 bytes in 3D.
     #[cfg(feature = "2d")]
-    pub angular_velocity: Scalar,
+    pub angular_velocity: f32,
     /// The angular velocity of the body.
     ///
-    /// 8 bytes in 2D and 12 bytes in 3D with the `f32` feature.
+    /// 8 bytes in 2D and 12 bytes in 3D.
     #[cfg(feature = "3d")]
     pub angular_velocity: Vector,
     /// The change in position of the body.
     ///
     /// Stored as a delta to avoid round-off error when far from the origin.
     ///
-    /// 8 bytes in 2D and 12 bytes in 3D with the `f32` feature.
+    /// 8 bytes in 2D and 12 bytes in 3D.
     pub delta_position: Vector,
     /// The change in rotation of the body.
     ///
     /// Stored as a delta because the rotation of static bodies cannot be accessed
     /// in the solver, but they have a known delta rotation of zero.
     ///
-    /// 8 bytes in 2D and 16 bytes in 3D with the `f32` feature.
-    pub delta_rotation: Rotation,
+    /// 8 bytes in 2D and 16 bytes in 3D.
+    pub delta_rotation: Rot,
     /// Flags for the body.
     ///
     /// 4 bytes.
@@ -99,7 +104,7 @@ impl SolverBody {
         #[cfg(feature = "3d")]
         angular_velocity: Vector::ZERO,
         delta_position: Vector::ZERO,
-        delta_rotation: Rotation::IDENTITY,
+        delta_rotation: Rot::IDENTITY,
         flags: SolverBodyFlags::empty(),
     };
 
@@ -153,6 +158,14 @@ bitflags::bitflags! {
         const IS_KINEMATIC = 1 << 6;
         /// Set if gyroscopic motion is enabled.
         const GYROSCOPIC_MOTION = 1 << 7;
+        /// Set if the body has a custom position integration implementation.
+        const CUSTOM_POSITION_INTEGRATION = 1 << 8;
+        /// Set during the continuous collision stage if the body moved fast enough
+        /// to be treated as a "fast body" and have its motion swept. Transient.
+        const IS_FAST = 1 << 9;
+        /// Set during the continuous collision stage if the body's motion was stopped
+        /// at a time of impact. Transient.
+        const HAD_TIME_OF_IMPACT = 1 << 10;
     }
 }
 
@@ -210,35 +223,35 @@ The API abstracts over this difference in representation to reduce complexity.
 /// This includes the effective inverse mass and angular inertia,
 /// and flags indicating whether the body is static or has locked axes.
 ///
-/// 16 bytes in 2D and 32 bytes in 3D with the `f32` feature.
-#[derive(Component, Clone, Debug, Reflect)]
+/// 16 bytes in 2D and 32 bytes in 3D.
+#[derive(Clone, Debug, Reflect)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
-#[reflect(Component, Debug)]
+#[reflect(Debug)]
 pub struct SolverBodyInertia {
     /// The effective inverse mass of the body,
     /// taking into account any locked axes.
     ///
-    /// 8 bytes with the `f32` feature.
+    /// 8 bytes.
     #[cfg(feature = "2d")]
     effective_inv_mass: Vector,
 
     /// The inverse mass of the body.
     ///
-    /// 4 bytes with the `f32` feature.
+    /// 4 bytes.
     #[cfg(feature = "3d")]
-    inv_mass: Scalar,
+    inv_mass: f32,
 
     /// The effective inverse angular inertia of the body,
     /// taking into account any locked axes.
     ///
-    /// 4 bytes with the `f32` feature.
+    /// 4 bytes.
     #[cfg(feature = "2d")]
     effective_inv_angular_inertia: SymmetricTensor,
 
     /// The world-space inverse angular inertia of the body.
     ///
-    /// 32 bytes with the `f32` feature.
+    /// 32 bytes.
     #[cfg(feature = "3d")]
     effective_inv_angular_inertia: SymmetricTensor,
 
@@ -332,7 +345,7 @@ impl SolverBodyInertia {
     #[inline]
     #[cfg(feature = "2d")]
     pub fn new(
-        inv_mass: Scalar,
+        inv_mass: f32,
         inv_inertia: SymmetricTensor,
         locked_axes: LockedAxes,
         dominance: i8,
@@ -376,7 +389,7 @@ impl SolverBodyInertia {
     #[inline]
     #[cfg(feature = "3d")]
     pub fn new(
-        inv_mass: Scalar,
+        inv_mass: f32,
         inv_inertia: SymmetricTensor,
         locked_axes: LockedAxes,
         dominance: i8,
@@ -473,7 +486,7 @@ impl SolverBodyInertia {
     pub fn update_effective_inv_angular_inertia(
         &mut self,
         computed_angular_inertia: &ComputedAngularInertia,
-        rotation: Quaternion,
+        rotation: Quat,
     ) {
         let locked_axes = self.flags.locked_axes();
         let mut effective_inv_angular_inertia =
@@ -516,5 +529,301 @@ impl SolverBodyInertia {
     #[inline]
     pub fn flags(&self) -> InertiaFlags {
         self.flags
+    }
+}
+
+/// A component storing the index of an entity's [`SolverBody`] in the [`SolverBodies`] resource.
+///
+/// Only awake dynamic and kinematic bodies have an associated solver body.
+/// Static bodies and sleeping dynamic bodies do not have a solver body, and instead
+/// use a "dummy state" with [`SolverBody::default()`] and [`SolverBodyInertia::default()`].
+///
+/// This component is added, removed, and updated automatically by the solver plugin,
+/// and should not be modified by users.
+#[derive(Component, Clone, Copy, Debug, Deref, PartialEq, Eq, PartialOrd, Ord, Hash, Reflect)]
+#[reflect(Component, Debug, PartialEq, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
+pub struct SolverBodyIndex(pub u32);
+
+impl SolverBodyIndex {
+    /// An invalid index used to indicate that a body has no associated [`SolverBody`],
+    /// such as a static body. The solver substitutes a dummy state in this case.
+    pub const INVALID: Self = Self(u32::MAX);
+
+    /// Returns `true` if the index refers to a valid [`SolverBody`] in the [`SolverBodies`] resource.
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.0 != u32::MAX
+    }
+}
+
+impl Default for SolverBodyIndex {
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
+/// A resource storing [solver bodies](SolverBody) and their [inertial properties](SolverBodyInertia)
+/// contiguously for awake, active rigid bodies.
+///
+/// Each entity with a solver body stores an index into this resource in a [`SolverBodyIndex`] component.
+#[derive(Resource, Default)]
+pub struct SolverBodies {
+    // TODO: Use `UniqueEntityVec`.
+    entities: Vec<Entity>,
+    bodies: Vec<SolverBody>,
+    inertias: Vec<SolverBodyInertia>,
+}
+
+impl SolverBodies {
+    /// Creates a new empty collection of solver bodies.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            entities: Vec::new(),
+            bodies: Vec::new(),
+            inertias: Vec::new(),
+        }
+    }
+
+    /// Returns the number of solver bodies.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bodies.len()
+    }
+
+    /// Returns `true` if there are no solver bodies.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bodies.is_empty()
+    }
+
+    /// Returns a slice of the entities that have solver bodies.
+    #[inline]
+    pub fn entities(&self) -> &[Entity] {
+        &self.entities
+    }
+
+    /// Returns a slice of the solver bodies.
+    #[inline]
+    pub fn bodies(&self) -> &[SolverBody] {
+        &self.bodies
+    }
+
+    /// Returns a mutable slice of the solver bodies.
+    #[inline]
+    pub fn bodies_mut(&mut self) -> &mut [SolverBody] {
+        &mut self.bodies
+    }
+
+    /// Returns a slice of the solver body inertias.
+    #[inline]
+    pub fn inertias(&self) -> &[SolverBodyInertia] {
+        &self.inertias
+    }
+
+    /// Returns a mutable slice of the solver body inertias.
+    #[inline]
+    pub fn inertias_mut(&mut self) -> &mut [SolverBodyInertia] {
+        &mut self.inertias
+    }
+
+    /// Returns `true` if the given [`SolverBodyIndex`] refers to a body in this collection.
+    #[inline]
+    pub fn contains_index(&self, index: SolverBodyIndex) -> bool {
+        (index.0 as usize) < self.bodies.len()
+    }
+
+    /// Returns `true` if the given entity has a solver body in this collection.
+    #[inline]
+    pub fn contains_entity(&self, entity: Entity) -> bool {
+        self.entities.contains(&entity)
+    }
+
+    /// Returns the [`Entity`] associated with the given solver body index, if any.
+    #[inline]
+    pub fn get_entity(&self, index: SolverBodyIndex) -> Option<Entity> {
+        self.entities.get(index.0 as usize).copied()
+    }
+
+    /// Returns a reference to the [`SolverBody`] with the given index, if it exists.
+    #[inline]
+    pub fn get(&self, index: SolverBodyIndex) -> Option<&SolverBody> {
+        self.bodies.get(index.0 as usize)
+    }
+
+    /// Returns a mutable reference to the [`SolverBody`] with the given index, if it exists.
+    #[inline]
+    pub fn get_mut(&mut self, index: SolverBodyIndex) -> Option<&mut SolverBody> {
+        self.bodies.get_mut(index.0 as usize)
+    }
+
+    /// Returns a reference to the [`SolverBodyInertia`] with the given index, if it exists.
+    #[inline]
+    pub fn get_inertia(&self, index: SolverBodyIndex) -> Option<&SolverBodyInertia> {
+        self.inertias.get(index.0 as usize)
+    }
+
+    /// Returns a mutable reference to the [`SolverBodyInertia`] with the given index, if it exists.
+    #[inline]
+    pub fn get_inertia_mut(&mut self, index: SolverBodyIndex) -> Option<&mut SolverBodyInertia> {
+        self.inertias.get_mut(index.0 as usize)
+    }
+
+    /// Returns an iterator over mutable references to the solver bodies.
+    #[inline]
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut SolverBody> {
+        self.bodies.iter_mut()
+    }
+
+    /// Adds a new solver body for the given entity, returning its [`SolverBodyIndex`].
+    #[inline]
+    pub fn push(
+        &mut self,
+        entity: Entity,
+        body: SolverBody,
+        inertia: SolverBodyInertia,
+    ) -> SolverBodyIndex {
+        let index = SolverBodyIndex(self.bodies.len() as u32);
+        self.entities.push(entity);
+        self.bodies.push(body);
+        self.inertias.push(inertia);
+        index
+    }
+
+    /// Removes the solver body with the given index, swapping in the last body to fill the gap.
+    ///
+    /// Returns the entity whose body was moved into `index`, so that its [`SolverBodyIndex`]
+    /// component can be updated. Returns `None` if the removed body was the last one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    #[inline]
+    pub fn swap_remove(&mut self, index: SolverBodyIndex) -> Option<Entity> {
+        self.entities.swap_remove(index.0 as usize);
+        self.bodies.swap_remove(index.0 as usize);
+        self.inertias.swap_remove(index.0 as usize);
+        // TODO: Do this differently
+        // If the removed body was not the last one, a body was swapped into its slot.
+        self.entities.get(index.0 as usize).copied()
+    }
+
+    /// Clears all solver bodies.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.entities.clear();
+        self.bodies.clear();
+        self.inertias.clear();
+    }
+
+    /// Returns a [`SolverBodiesAccess`] that allows obtaining mutable references to solver bodies
+    /// from parallel closures via raw pointers.
+    ///
+    /// This allows the solver to hand out mutable references to disjoint bodies concurrently,
+    /// which is sound as long as the caller ensures that no two closures access the same body
+    /// at the same time. This is guaranteed by constraint graph coloring.
+    #[inline]
+    pub fn access(&mut self) -> SolverBodiesAccess<'_> {
+        SolverBodiesAccess {
+            bodies: self.bodies.as_mut_ptr(),
+            inertias: self.inertias.as_mut_ptr(),
+            len: self.bodies.len(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Mutable disjoint access to the bodies and inertias of a [`SolverBodies`] resource
+/// for use inside the parallel solver.
+///
+/// The caller is responsible for ensuring that no two closures access the same body
+/// at the same time. This is guaranteed by constraint graph coloring and each
+/// [`SolverBodyIndex`] being unique to a single body.
+pub struct SolverBodiesAccess<'a> {
+    bodies: *mut SolverBody,
+    inertias: *mut SolverBodyInertia,
+    len: usize,
+    _marker: PhantomData<&'a mut SolverBodies>,
+}
+
+// SAFETY: The caller is responsible for only accessing disjoint indices concurrently.
+unsafe impl Send for SolverBodiesAccess<'_> {}
+// SAFETY: The caller is responsible for only accessing disjoint indices concurrently.
+unsafe impl Sync for SolverBodiesAccess<'_> {}
+
+impl SolverBodiesAccess<'_> {
+    /// Returns the number of solver bodies.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if there are no solver bodies.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns a mutable reference to the [`SolverBody`] with the given index.
+    ///
+    /// # Safety
+    ///
+    /// The index must be in bounds, and no other reference to the same body may be held concurrently.
+    #[inline]
+    #[expect(clippy::mut_from_ref)]
+    pub unsafe fn body_unchecked_mut(&self, index: SolverBodyIndex) -> &mut SolverBody {
+        debug_assert!((index.0 as usize) < self.len);
+        unsafe { &mut *self.bodies.add(index.0 as usize) }
+    }
+
+    /// Returns a mutable reference to the [`SolverBodyInertia`] with the given index.
+    ///
+    /// # Safety
+    ///
+    /// The index must be in bounds, and no other reference to the same inertia may be held concurrently.
+    #[inline]
+    #[expect(clippy::mut_from_ref)]
+    pub unsafe fn inertia_unchecked_mut(&self, index: SolverBodyIndex) -> &mut SolverBodyInertia {
+        debug_assert!((index.0 as usize) < self.len);
+        unsafe { &mut *self.inertias.add(index.0 as usize) }
+    }
+
+    /// Returns mutable body references and inertia references for the two given indices.
+    ///
+    /// An [`SolverBodyIndex::INVALID`] index yields `None` for that body, in which case the caller
+    /// should substitute [`SolverBody::DUMMY`] and [`SolverBodyInertia::DUMMY`].
+    ///
+    /// # Safety
+    ///
+    /// If both indices are valid, they must be different. Valid indices must be in bounds,
+    /// and no other references to the same bodies may be held concurrently.
+    #[inline]
+    #[expect(clippy::mut_from_ref)]
+    pub unsafe fn get_pair_unchecked_mut(
+        &self,
+        a: SolverBodyIndex,
+        b: SolverBodyIndex,
+    ) -> (
+        Option<(&mut SolverBody, &SolverBodyInertia)>,
+        Option<(&mut SolverBody, &SolverBodyInertia)>,
+    ) {
+        debug_assert!(!a.is_valid() || !b.is_valid() || a != b);
+        unsafe {
+            let first = a.is_valid().then(|| {
+                (
+                    &mut *self.bodies.add(a.0 as usize),
+                    &*self.inertias.add(a.0 as usize),
+                )
+            });
+            let second = b.is_valid().then(|| {
+                (
+                    &mut *self.bodies.add(b.0 as usize),
+                    &*self.inertias.add(b.0 as usize),
+                )
+            });
+            (first, second)
+        }
     }
 }

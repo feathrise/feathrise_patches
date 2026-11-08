@@ -28,11 +28,13 @@ use bevy::{
 
 use crate::{
     data_structures::bit_vec::BitVec,
-    dynamics::solver::{
-        constraint_graph::ConstraintGraph,
-        islands::{BodyIslandNode, IslandId, PhysicsIslands},
-        joint_graph::JointGraph,
-        solver_body::SolverBody,
+    dynamics::{
+        joints::joint_graph::JointGraph,
+        solver::{
+            constraint_graph::ConstraintGraph,
+            islands::{BodyIslandNode, IslandId, PhysicsIslands},
+            solver_body::{SolverBodies, SolverBodyIndex},
+        },
     },
     prelude::*,
     schedule::{LastPhysicsTick, is_changed_after_tick},
@@ -46,9 +48,9 @@ impl Plugin for IslandSleepingPlugin {
         app.init_resource::<AwakeIslandBitVec>();
         app.init_resource::<TimeToSleep>();
 
-        // Insert `SleepThreshold` and `SleepTimer` for each `SolverBody`.
-        app.register_required_components::<SolverBody, SleepThreshold>();
-        app.register_required_components::<SolverBody, SleepTimer>();
+        // Insert `SleepThreshold` and `SleepTimer` for each body that has a solver body.
+        app.register_required_components::<SolverBodyIndex, SleepThreshold>();
+        app.register_required_components::<SolverBodyIndex, SleepTimer>();
 
         // Set up cached system states for sleeping and waking bodies or islands.
         let cached_system_state1 = CachedBodySleepingSystemState(SystemState::new(app.world_mut()));
@@ -123,7 +125,7 @@ fn wake_on_remove_sleeping(mut world: DeferredWorld, ctx: HookContext) {
 }
 
 fn wake_on_replace_rigid_body(
-    trigger: On<Discard, RigidBody>,
+    trigger: On<Discard<RigidBody>>,
     mut commands: Commands,
     query: Query<&BodyIslandNode>,
 ) {
@@ -135,7 +137,7 @@ fn wake_on_replace_rigid_body(
 }
 
 fn wake_on_enable_rigid_body(
-    trigger: On<Insert, BodyIslandNode>,
+    trigger: On<Insert<BodyIslandNode>>,
     mut commands: Commands,
     mut query: Query<
         (&BodyIslandNode, &mut SleepTimer, Has<Sleeping>),
@@ -184,11 +186,12 @@ fn wake_islands_with_sleeping_disabled(
 fn update_sleeping_states(
     mut awake_island_bit_vec: ResMut<AwakeIslandBitVec>,
     mut islands: ResMut<PhysicsIslands>,
+    solver_bodies: Res<SolverBodies>,
     mut query: Query<
         (
             &mut SleepTimer,
             &SleepThreshold,
-            &SolverBody,
+            &SolverBodyIndex,
             &BodyIslandNode,
         ),
         (Without<Sleeping>, Without<SleepingDisabled>),
@@ -203,7 +206,10 @@ fn update_sleeping_states(
     islands.split_candidate_sleep_timer = 0.0;
 
     // TODO: This would be nice to do in parallel.
-    for (mut sleep_timer, sleep_threshold, solver_body, island_data) in query.iter_mut() {
+    for (mut sleep_timer, sleep_threshold, index, island_data) in query.iter_mut() {
+        let Some(solver_body) = solver_bodies.get(*index) else {
+            continue;
+        };
         let lin_vel_squared = solver_body.linear_velocity.length_squared();
         #[cfg(feature = "2d")]
         let ang_vel_squared = solver_body.angular_velocity * solver_body.angular_velocity;
@@ -214,8 +220,8 @@ fn update_sleeping_states(
         let lin_threshold_squared = sleep_threshold.linear * sleep_threshold.linear.abs();
         let ang_threshold_squared = sleep_threshold.angular * sleep_threshold.angular.abs();
 
-        if lin_vel_squared < length_unit_squared * lin_threshold_squared as Scalar
-            && ang_vel_squared < ang_threshold_squared as Scalar
+        if lin_vel_squared < length_unit_squared * lin_threshold_squared
+            && ang_vel_squared < ang_threshold_squared
         {
             // Increment the sleep timer.
             sleep_timer.0 += delta_secs;
@@ -264,16 +270,20 @@ fn sleep_islands(
     }
 
     // Sleep islands.
-    let sleep_buffer = sleep_buffer.clone();
-    commands.queue(|world: &mut World| {
-        SleepIslands(sleep_buffer).apply(world);
-    });
+    if !sleep_buffer.is_empty() {
+        let sleep_buffer = sleep_buffer.clone();
+        commands.queue(|world: &mut World| {
+            SleepIslands(sleep_buffer).apply(world);
+        });
+    }
 
     // Wake islands.
-    let wake_buffer = wake_buffer.clone();
-    commands.queue(|world: &mut World| {
-        WakeIslands(wake_buffer).apply(world);
-    });
+    if !wake_buffer.is_empty() {
+        let wake_buffer = wake_buffer.clone();
+        commands.queue(|world: &mut World| {
+            WakeIslands(wake_buffer).apply(world);
+        });
+    }
 
     // Reset the awake island bit vector.
     awake_island_bit_vec.set_bit_count_and_clear(islands.len());
@@ -303,8 +313,8 @@ impl Command for SleepBody {
                         mut body_islands,
                         body_colliders,
                         mut islands,
-                        mut contact_graph,
-                        mut joint_graph,
+                        contact_graph,
+                        joint_graph,
                     ) = state.0.get_mut(world).unwrap();
 
                     let Some(island) = islands.get_mut(island_id) else {
@@ -318,8 +328,8 @@ impl Command for SleepBody {
                             island_id,
                             &mut body_islands,
                             &body_colliders,
-                            &mut contact_graph,
-                            &mut joint_graph,
+                            &contact_graph,
+                            &joint_graph,
                         );
                     }
 
@@ -364,17 +374,22 @@ pub struct SleepIslands(pub Vec<IslandId>);
 impl Command for SleepIslands {
     type Out = ();
     fn apply(self, world: &mut World) {
+        if self.0.is_empty() {
+            return;
+        }
         world.try_resource_scope(|world, mut state: Mut<CachedIslandSleepingSystemState>| {
             let (bodies, mut islands, mut contact_graph, mut constraint_graph) =
                 state.0.get_mut(world).unwrap();
 
             let mut bodies_to_sleep = Vec::<(Entity, Sleeping)>::new();
+            let mut colliders_to_sleep = Vec::<Entity>::new();
 
+            // First, mark every island in this batch as sleeping and gather their bodies and colliders.
             for island_id in self.0 {
                 if let Some(island) = islands.get_mut(island_id) {
                     if island.is_sleeping {
                         // The island is already sleeping, no need to sleep it again.
-                        return;
+                        continue;
                     }
 
                     island.is_sleeping = true;
@@ -387,44 +402,46 @@ impl Command for SleepIslands {
                             continue;
                         };
 
-                        // Transfer the contact pairs to the sleeping set, and remove the body from the constraint graph.
                         if let Some(colliders) = colliders {
-                            for collider in colliders {
-                                contact_graph.sleep_entity_with(collider, |graph, contact_pair| {
-                                    // Remove touching contacts from the constraint graph.
-                                    if !contact_pair.is_touching()
-                                        || !contact_pair.generates_constraints()
-                                    {
-                                        return;
-                                    }
-                                    let contact_edge = graph
-                                    .get_edge_mut_by_id(contact_pair.contact_id)
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "Contact edge with id {:?} not found in contact graph.",
-                                            contact_pair.contact_id
-                                        )
-                                    });
-                                    if let (Some(body1), Some(body2)) =
-                                        (contact_pair.body1, contact_pair.body2)
-                                    {
-                                        for _ in 0..contact_edge.constraint_handles.len() {
-                                            constraint_graph.pop_manifold(
-                                                &mut graph.edges,
-                                                contact_pair.contact_id,
-                                                body1,
-                                                body2,
-                                            );
-                                        }
-                                    }
-                                });
-                            }
+                            colliders_to_sleep.extend(colliders);
                         }
 
                         bodies_to_sleep.push((entity, Sleeping));
                         body = body_island.next;
                     }
                 }
+            }
+
+            // A pair may only be put to sleep once its other body is also asleep or immovable.
+            let is_other_body_asleep = |other_body: Option<Entity>| -> bool {
+                let Some(other) = other_body else {
+                    return true;
+                };
+                match bodies.get(other) {
+                    Ok((body_island, _, _)) => islands
+                        .get(body_island.island_id)
+                        .is_none_or(|island| island.is_sleeping),
+                    Err(_) => true,
+                }
+            };
+
+            // Transfer the contact pairs to the sleeping set, and remove touching contacts
+            // from the constraint graph.
+            for collider in colliders_to_sleep {
+                contact_graph.sleep_entity_with(
+                    collider,
+                    |_graph, contact_pair| {
+                        // Remove touching contacts from the constraint graph.
+                        if !contact_pair.is_touching() || !contact_pair.generates_constraints() {
+                            return;
+                        }
+                        if let (Some(body1), Some(body2)) = (contact_pair.body1, contact_pair.body2)
+                        {
+                            constraint_graph.remove_contact(contact_pair.contact_id, body1, body2);
+                        }
+                    },
+                    is_other_body_asleep,
+                );
             }
 
             // Batch insert `Sleeping` to the bodies.
@@ -476,6 +493,9 @@ pub struct WakeIslands(pub Vec<IslandId>);
 impl Command for WakeIslands {
     type Out = ();
     fn apply(self, world: &mut World) {
+        if self.0.is_empty() {
+            return;
+        }
         world.try_resource_scope(|world, mut state: Mut<CachedIslandWakingSystemState>| {
             let (mut bodies, mut islands, mut contact_graph, mut constraint_graph) =
                 state.0.get_mut(world).unwrap();
@@ -503,23 +523,15 @@ impl Command for WakeIslands {
                         // Transfer the contact pairs to the awake set, and add touching contacts to the constraint graph.
                         if let Some(colliders) = colliders {
                             for collider in colliders {
-                                contact_graph.wake_entity_with(collider, |graph, contact_pair| {
+                                contact_graph.wake_entity_with(collider, |_graph, contact_pair| {
                                     // Add touching contacts to the constraint graph.
                                     if !contact_pair.is_touching()
                                         || !contact_pair.generates_constraints()
                                     {
                                         return;
                                     }
-                                    let contact_edge = graph
-                                    .get_edge_mut_by_id(contact_pair.contact_id)
-                                    .unwrap_or_else(|| {
-                                        panic!(
-                                            "Contact edge with id {:?} not found in contact graph.",
-                                            contact_pair.contact_id
-                                        )
-                                    });
                                     for _ in contact_pair.manifolds.iter() {
-                                        constraint_graph.push_manifold(contact_edge, contact_pair);
+                                        constraint_graph.push_manifold(contact_pair);
                                     }
                                 });
                             }

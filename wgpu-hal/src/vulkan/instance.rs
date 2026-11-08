@@ -2,7 +2,6 @@ use alloc::{borrow::ToOwned as _, boxed::Box, ffi::CString, string::String, sync
 use core::{
     ffi::{c_void, CStr},
     marker::PhantomData,
-    mem::ManuallyDrop,
     slice,
     str::FromStr,
 };
@@ -42,7 +41,14 @@ pub fn set_entry_library_path(path: impl AsRef<OsStr>) -> Result<(), OsString> {
 unsafe fn load_entry() -> Result<ash::Entry, ash::LoadingError> {
     match ENTRY_LIBRARY_PATH.get() {
         Some(path) => unsafe { ash::Entry::load_from(path) },
-        None => unsafe { ash::Entry::load() },
+        None => {
+            // 未登记代理时沿用平台加载器，包括 30.0 新增的 OHOS 库名。
+            #[cfg(target_env = "ohos")]
+            let loaded = unsafe { ash::Entry::load_from("libvulkan.so") };
+            #[cfg(not(target_env = "ohos"))]
+            let loaded = unsafe { ash::Entry::load() };
+            loaded
+        },
     }
 }
 
@@ -298,11 +304,7 @@ impl super::Instance {
             extensions.push(ext::metal_surface::NAME);
             extensions.push(khr::portability_enumeration::NAME);
         }
-        if cfg!(all(
-            unix,
-            not(target_vendor = "apple"),
-            not(target_family = "wasm")
-        )) {
+        if cfg!(drm) {
             // VK_EXT_acquire_drm_display -> VK_EXT_direct_mode_display -> VK_KHR_display
             extensions.push(ext::acquire_drm_display::NAME);
             extensions.push(ext::direct_mode_display::NAME);
@@ -446,7 +448,7 @@ impl super::Instance {
                 .expect("XlibSurface::create_xlib_surface() failed")
         };
 
-        Ok(self.create_surface_from_vk_surface_khr(surface))
+        Ok(self.create_surface_from_vk_surface_khr(surface, None))
     }
 
     fn create_surface_from_xcb(
@@ -471,7 +473,7 @@ impl super::Instance {
                 .expect("XcbSurface::create_xcb_surface() failed")
         };
 
-        Ok(self.create_surface_from_vk_surface_khr(surface))
+        Ok(self.create_surface_from_vk_surface_khr(surface, None))
     }
 
     fn create_surface_from_wayland(
@@ -496,7 +498,7 @@ impl super::Instance {
             unsafe { w_loader.create_wayland_surface(&info, None) }.expect("WaylandSurface failed")
         };
 
-        Ok(self.create_surface_from_vk_surface_khr(surface))
+        Ok(self.create_surface_from_vk_surface_khr(surface, None))
     }
 
     fn create_surface_android(
@@ -519,7 +521,7 @@ impl super::Instance {
             unsafe { a_loader.create_android_surface(&info, None) }.expect("AndroidSurface failed")
         };
 
-        Ok(self.create_surface_from_vk_surface_khr(surface))
+        Ok(self.create_surface_from_vk_surface_khr(surface, None))
     }
 
     fn create_surface_from_hwnd(
@@ -547,7 +549,15 @@ impl super::Instance {
             }
         };
 
-        Ok(self.create_surface_from_vk_surface_khr(surface))
+        // Wrap ash's `isize` `HWND` in `WindowHandle`; on Windows the
+        // `NativeSurface` builds its DXGI HDR source from it.
+        #[cfg(windows)]
+        let window_handle = Some(crate::vulkan::swapchain::WindowHandle(
+            windows::Win32::Foundation::HWND(hwnd as *mut c_void),
+        ));
+        #[cfg(not(windows))]
+        let window_handle: Option<crate::vulkan::swapchain::WindowHandle> = None;
+        Ok(self.create_surface_from_vk_surface_khr(surface, window_handle))
     }
 
     #[cfg(target_vendor = "apple")]
@@ -573,19 +583,20 @@ impl super::Instance {
             unsafe { metal_loader.create_metal_surface(&vk_info, None).unwrap() }
         };
 
-        Ok(self.create_surface_from_vk_surface_khr(surface))
+        Ok(self.create_surface_from_vk_surface_khr(surface, None))
     }
 
     pub(super) fn create_surface_from_vk_surface_khr(
         &self,
         surface: vk::SurfaceKHR,
+        hwnd: Option<crate::vulkan::swapchain::WindowHandle>,
     ) -> super::Surface {
         let native_surface =
-            crate::vulkan::swapchain::NativeSurface::from_vk_surface_khr(self, surface);
+            crate::vulkan::swapchain::NativeSurface::from_vk_surface_khr(self, surface, hwnd);
 
         super::Surface {
-            inner: ManuallyDrop::new(Box::new(native_surface)),
             swapchain: RwLock::new(None),
+            inner: Box::new(native_surface),
         }
     }
 
@@ -926,6 +937,10 @@ impl crate::Instance for super::Instance {
                 let connection = display.connection.expect("Pointer to X-Server is not set.");
                 self.create_surface_from_xcb(connection.as_ptr(), handle.window.get())
             }
+            #[cfg(drm)]
+            (Rwh::Drm(handle), Rdh::Drm(display)) => {
+                self.create_surface_from_drm_plane(display.fd, handle.plane)
+            }
             (Rwh::AndroidNdk(handle), _) => {
                 self.create_surface_android(handle.a_native_window.as_ptr())
             }
@@ -1018,12 +1033,6 @@ impl crate::Instance for super::Instance {
     }
 }
 
-impl Drop for super::Surface {
-    fn drop(&mut self) {
-        unsafe { ManuallyDrop::take(&mut self.inner).delete_surface() };
-    }
-}
-
 impl crate::Surface for super::Surface {
     type A = super::Api;
 
@@ -1053,7 +1062,6 @@ impl crate::Surface for super::Surface {
             super::present_telemetry::released(); // 先撤证据，再进入既有 GPU/SDK 生命周期等待。
             // SAFETY: `unconfigure`'s contract guarantees there are no resources derived from the swapchain in use.
             unsafe { sc.release_resources(device) };
-            unsafe { sc.delete_swapchain() };
         }
     }
 

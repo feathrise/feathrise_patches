@@ -232,7 +232,7 @@ pub struct Dlss<F: DlssFeature = DlssSuperResolutionFeature> {
     pub _phantom_data: PhantomData<F>,
 }
 
-impl Default for Dlss<DlssSuperResolutionFeature> {
+impl<F: DlssFeature> Default for Dlss<F> {
     fn default() -> Self {
         Self {
             perf_quality_mode: Default::default(),
@@ -370,7 +370,8 @@ impl DlssFeature for DlssRayReconstructionFeature {
         DlssRayReconstruction::new(
             upscaled_resolution.to_array(),
             perf_quality_mode,
-            feature_flags,
+            // Not supported by ray reconstruction
+            feature_flags - dlss_wgpu::DlssFeatureFlags::AutoExposure,
             DlssRayReconstructionRoughnessMode::Packed,
             DlssRayReconstructionDepthMode::Hardware,
             sdk,
@@ -386,6 +387,7 @@ pub struct ViewDlssRayReconstructionTextures {
     pub diffuse_albedo: CachedTexture,
     pub specular_albedo: CachedTexture,
     pub normal_roughness: CachedTexture,
+    pub depth: CachedTexture,
     pub specular_motion_vectors: CachedTexture,
 }
 

@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "avian3d"
-version = "0.7.0"
+version = "0.8.0"
 authors = ["Joona Aalto <jondolf.dev@gmail.com>"]
 build = false
 autolib = false
@@ -56,7 +56,6 @@ debug-plugin = [
 ]
 default = [
     "3d",
-    "f32",
     "parry-f32",
     "debug-plugin",
     "xpbd_joints",
@@ -77,7 +76,6 @@ enhanced-determinism = [
     "parry3d?/enhanced-determinism",
     "parry3d-f64?/enhanced-determinism",
 ]
-f32 = []
 f64 = []
 parallel = [
     "bevy/multi_threaded",
@@ -85,7 +83,6 @@ parallel = [
     "parry3d-f64?/parallel",
 ]
 parry-f32 = [
-    "f32",
     "dep:parry3d",
     "default-collider",
 ]
@@ -105,10 +102,7 @@ serialize = [
     "smallvec/serde",
     "bitflags/serde",
 ]
-simd = [
-    "parry3d?/simd-stable",
-    "parry3d-f64?/simd-stable",
-]
+test = []
 validate = []
 xpbd_joints = []
 
@@ -182,6 +176,15 @@ required-features = [
     "3d",
     "default-collider",
     "xpbd_joints",
+]
+
+[[example]]
+name = "debug_render_spatial_query_3d"
+path = "examples/debug_render_spatial_query_3d.rs"
+required-features = [
+    "3d",
+    "debug-plugin",
+    "bevy_scene",
 ]
 
 [[example]]
@@ -321,22 +324,30 @@ version = "0.5"
 version = "0.2"
 
 [dependencies.bevy]
-version = "0.19.0"
+version = "0.20"
 features = [
     "std",
     "bevy_log",
 ]
 default-features = false
 
+[dependencies.bevy_curve]
+version = "0.20"
+features = ["approx"]
+
 [dependencies.bevy_heavy]
-version = "0.5"
+version = "0.6"
 
 [dependencies.bevy_math]
-version = "0.19.0"
+version = "0.20"
+features = ["approx"]
+
+[dependencies.bevy_shape]
+version = "0.20"
 features = ["approx"]
 
 [dependencies.bevy_transform_interpolation]
-version = "0.5"
+version = "0.6"
 
 [dependencies.bitflags]
 version = "2.5.0"
@@ -348,7 +359,7 @@ version = "2"
 version = "1.0"
 
 [dependencies.glam_matrix_extras]
-version = "0.3"
+version = "0.4"
 features = ["bevy_reflect"]
 
 [dependencies.itertools]
@@ -359,14 +370,14 @@ version = "0.2"
 optional = true
 
 [dependencies.obvhs]
-version = "0.3"
+version = "0.4"
 
 [dependencies.parry3d]
-version = "0.27"
+version = "0.31"
 optional = true
 
 [dependencies.parry3d-f64]
-version = "0.27"
+version = "0.31"
 optional = true
 
 [dependencies.serde]
@@ -384,7 +395,7 @@ version = "2"
 version = "1.1"
 
 [dev-dependencies.bevy]
-version = "0.19.0"
+version = "0.20"
 features = [
     "3d",
     "ui",
@@ -393,11 +404,11 @@ features = [
 ]
 
 [dev-dependencies.bevy_heavy]
-version = "0.5"
+version = "0.6"
 features = ["approx"]
 
 [dev-dependencies.bevy_mod_debugdump]
-version = "0.16"
+version = "0.17"
 
 [dev-dependencies.criterion]
 version = "0.8"

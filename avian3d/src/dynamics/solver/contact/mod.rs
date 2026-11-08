@@ -9,19 +9,13 @@ pub use tangent_part::ContactTangentPart;
 use core::cmp::Ordering;
 
 use crate::{
-    collision::contact_types::ContactId,
-    dynamics::solver::{BodyQueryItem, ContactSoftnessCoefficients},
-    prelude::*,
+    collision::contact_types::ContactId, dynamics::solver::ContactSoftnessCoefficients, prelude::*,
 };
 #[cfg(feature = "serialize")]
 use bevy::reflect::{ReflectDeserialize, ReflectSerialize};
-use bevy::{
-    ecs::entity::{Entity, EntityMapper, MapEntities},
-    reflect::Reflect,
-    utils::default,
-};
+use bevy::{reflect::Reflect, utils::default};
 
-use super::solver_body::{SolverBody, SolverBodyInertia};
+use super::solver_body::{SolverBody, SolverBodyIndex, SolverBodyInertia};
 
 // TODO: One-body constraint version
 /// Data and logic for solving a single contact point for a [`ContactConstraint`].
@@ -45,12 +39,12 @@ pub struct ContactConstraintPoint {
     pub anchor2: Vector,
 
     /// The pre-solve relative velocity of the bodies along the normal at the contact point.
-    pub normal_speed: Scalar,
+    pub normal_speed: f32,
 
     /// The pre-solve separation distance between the bodies.
     ///
     /// A negative separation indicates penetration.
-    pub initial_separation: Scalar,
+    pub initial_separation: f32,
 }
 
 /// A contact constraint used for resolving inter-penetration between two bodies.
@@ -62,26 +56,28 @@ pub struct ContactConstraintPoint {
 #[cfg_attr(feature = "serialize", reflect(Serialize, Deserialize))]
 #[reflect(Debug, PartialEq)]
 pub struct ContactConstraint {
-    /// The first rigid body entity in the contact.
-    pub body1: Entity,
-    /// The second rigid body entity in the contact.
-    pub body2: Entity,
+    /// The [`SolverBodyIndex`] of the first body in the contact,
+    /// or [`SolverBodyIndex::INVALID`] if it is static or sleeping.
+    pub body_index1: SolverBodyIndex,
+    /// The [`SolverBodyIndex`] of the second body in the contact,
+    /// or [`SolverBodyIndex::INVALID`] if it is static or sleeping.
+    pub body_index2: SolverBodyIndex,
     /// The relative dominance of the bodies.
     ///
     /// If the relative dominance is positive, the first body is dominant
     /// and is considered to have infinite mass.
     pub relative_dominance: i16,
     /// The combined coefficient of dynamic [friction](Friction) of the bodies.
-    pub friction: Scalar,
+    pub friction: f32,
     /// The combined coefficient of [restitution](Restitution) of the bodies.
-    pub restitution: Scalar,
+    pub restitution: f32,
     /// The desired relative linear speed of the bodies along the surface,
     /// expressed in world space as `tangent_speed2 - tangent_speed1`.
     ///
     /// Defaults to zero. If set to a non-zero value, this can be used to simulate effects
     /// such as conveyor belts.
     #[cfg(feature = "2d")]
-    pub tangent_speed: Scalar,
+    pub tangent_speed: f32,
     /// The desired relative linear velocity of the bodies along the surface,
     /// expressed in world space as `tangent_velocity2 - tangent_velocity1`.
     ///
@@ -108,20 +104,18 @@ pub struct ContactConstraint {
 impl ContactConstraint {
     /// Generates a new [`ContactConstraint`] from the given bodies and contact manifold.
     pub(super) fn generate(
-        body1_entity: Entity,
-        body2_entity: Entity,
-        body1: BodyQueryItem,
-        body2: BodyQueryItem,
+        body_index1: SolverBodyIndex,
+        body_index2: SolverBodyIndex,
+        inertia1: &SolverBodyInertia,
+        inertia2: &SolverBodyInertia,
+        linear_velocity1: Vector,
+        linear_velocity2: Vector,
         contact_id: ContactId,
         manifold: &ContactManifold,
         manifold_index: usize,
         warm_start_enabled: bool,
         softness: &ContactSoftnessCoefficients,
     ) -> Self {
-        // Get the solver body inertia if it exists, or use a dummy inertia for static bodies.
-        let inertia1 = body1.inertia.unwrap_or(&SolverBodyInertia::DUMMY);
-        let inertia2 = body2.inertia.unwrap_or(&SolverBodyInertia::DUMMY);
-
         // Compute the relative dominance of the bodies.
         let relative_dominance = inertia1.dominance() - inertia2.dominance();
 
@@ -155,11 +149,8 @@ impl ContactConstraint {
 
         let effective_inverse_mass_sum = inv_mass1 + inv_mass2;
 
-        let tangents = compute_tangent_directions(
-            manifold.normal,
-            body1.linear_velocity.0,
-            body2.linear_velocity.0,
-        );
+        let tangents =
+            compute_tangent_directions(manifold.normal, linear_velocity1, linear_velocity2);
 
         let mut points = Vec::with_capacity(manifold.points.len());
 
@@ -201,8 +192,8 @@ impl ContactConstraint {
         }
 
         ContactConstraint {
-            body1: body1_entity,
-            body2: body2_entity,
+            body_index1,
+            body_index2,
             relative_dominance,
             friction: manifold.friction,
             restitution: manifold.restitution,
@@ -226,7 +217,7 @@ impl ContactConstraint {
         body2: &mut SolverBody,
         inertia1: &SolverBodyInertia,
         inertia2: &SolverBodyInertia,
-        warm_start_coefficient: Scalar,
+        warm_start_coefficient: f32,
     ) {
         let inv_mass1 = inertia1.effective_inv_mass();
         let inv_mass2 = inertia2.effective_inv_mass();
@@ -264,15 +255,14 @@ impl ContactConstraint {
     }
 
     /// Solves the [`ContactConstraint`], applying an impulse to the given bodies.
-    pub fn solve(
+    pub fn solve<const USE_BIAS: bool>(
         &mut self,
         body1: &mut SolverBody,
         body2: &mut SolverBody,
         inertia1: &SolverBodyInertia,
         inertia2: &SolverBodyInertia,
-        delta_secs: Scalar,
-        use_bias: bool,
-        max_overlap_solve_speed: Scalar,
+        delta_secs: f32,
+        max_overlap_solve_speed: f32,
     ) {
         let inv_mass1 = inertia1.effective_inv_mass();
         let inv_mass2 = inertia2.effective_inv_mass();
@@ -286,7 +276,7 @@ impl ContactConstraint {
             let r1 = body1.delta_rotation * point.anchor1;
             let r2 = body2.delta_rotation * point.anchor2;
 
-            // Compute current saparation.
+            // Compute current separation.
             let delta_separation = delta_translation + (r2 - r1);
             let separation = delta_separation.dot(self.normal) + point.initial_separation;
 
@@ -298,11 +288,10 @@ impl ContactConstraint {
             let relative_velocity = body2.velocity_at_point(r2) - body1.velocity_at_point(r1);
 
             // Compute the incremental impulse. The clamping and impulse accumulation is handled by the method.
-            let impulse_magnitude = point.normal_part.solve_impulse(
+            let impulse_magnitude = point.normal_part.solve_impulse::<USE_BIAS>(
                 separation,
                 relative_velocity,
                 self.normal,
-                use_bias,
                 max_overlap_solve_speed,
                 delta_secs,
             );
@@ -317,39 +306,42 @@ impl ContactConstraint {
             body2.angular_velocity += inv_angular_inertia2 * cross(r2, impulse);
         }
 
-        let tangent_directions = self.tangent_directions();
+        // Friction impulses, only during the relaxation stage.
+        // Applying friction during the bias stage does not meaningfully improve quality for the cost.
+        if !USE_BIAS {
+            let tangent_directions = self.tangent_directions();
 
-        // Friction
-        for point in self.points.iter_mut() {
-            let Some(ref mut friction_part) = point.tangent_part else {
-                continue;
-            };
+            for point in self.points.iter_mut() {
+                let Some(ref mut friction_part) = point.tangent_part else {
+                    continue;
+                };
 
-            // Fixed anchors
-            let r1 = point.anchor1;
-            let r2 = point.anchor2;
+                // Fixed anchors
+                let r1 = point.anchor1;
+                let r2 = point.anchor2;
 
-            // Relative velocity at contact point
-            let relative_velocity = body2.velocity_at_point(r2) - body1.velocity_at_point(r1);
+                // Relative velocity at contact point
+                let relative_velocity = body2.velocity_at_point(r2) - body1.velocity_at_point(r1);
 
-            // Compute the incremental impulse. The clamping and impulse accumulation is handled by the method.
-            let impulse = friction_part.solve_impulse(
-                tangent_directions,
-                relative_velocity,
-                #[cfg(feature = "2d")]
-                self.tangent_speed,
-                #[cfg(feature = "3d")]
-                self.tangent_velocity,
-                self.friction,
-                point.normal_part.impulse,
-            );
+                // Compute the incremental impulse. The clamping and impulse accumulation is handled by the method.
+                let impulse = friction_part.solve_impulse(
+                    tangent_directions,
+                    relative_velocity,
+                    #[cfg(feature = "2d")]
+                    self.tangent_speed,
+                    #[cfg(feature = "3d")]
+                    self.tangent_velocity,
+                    self.friction,
+                    point.normal_part.impulse,
+                );
 
-            // Apply the impulse.
-            body1.linear_velocity -= impulse * inv_mass1;
-            body1.angular_velocity -= inv_angular_inertia1 * cross(r1, impulse);
+                // Apply the impulse.
+                body1.linear_velocity -= impulse * inv_mass1;
+                body1.angular_velocity -= inv_angular_inertia1 * cross(r1, impulse);
 
-            body2.linear_velocity += impulse * inv_mass2;
-            body2.angular_velocity += inv_angular_inertia2 * cross(r2, impulse);
+                body2.linear_velocity += impulse * inv_mass2;
+                body2.angular_velocity += inv_angular_inertia2 * cross(r2, impulse);
+            }
         }
     }
 
@@ -361,7 +353,7 @@ impl ContactConstraint {
         body2: &mut SolverBody,
         inertia1: &SolverBodyInertia,
         inertia2: &SolverBodyInertia,
-        threshold: Scalar,
+        threshold: f32,
     ) {
         let inv_mass1 = inertia1.effective_inv_mass();
         let inv_mass2 = inertia2.effective_inv_mass();
@@ -445,12 +437,5 @@ fn compute_tangent_directions(
             .unwrap_or(force_direction.any_orthonormal_vector());
         let bitangent = force_direction.cross(tangent);
         [tangent, bitangent]
-    }
-}
-
-impl MapEntities for ContactConstraint {
-    fn map_entities<M: EntityMapper>(&mut self, entity_mapper: &mut M) {
-        self.body1 = entity_mapper.get_mapped(self.body1);
-        self.body2 = entity_mapper.get_mapped(self.body2);
     }
 }

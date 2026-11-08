@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "dlss_wgpu"
-version = "4.0.0"
+version = "6.0.0"
 build = "build.rs"
 autolib = false
 autobins = false
@@ -50,12 +50,15 @@ version = "2"
 version = "1"
 
 [dependencies.wgpu]
-version = "29"
+version = "30"
 features = ["vulkan"]
 default-features = false
 
 [build-dependencies.bindgen]
-version = "0.72"
+version = "0.73"
+# 生成的 NGX 绑定无需格式化。避免 prettyplease 与 bindgen 解析到不同版本的 syn。
+default-features = false
+features = ["logging", "runtime"]
 
 [build-dependencies.cc]
 version = "1"

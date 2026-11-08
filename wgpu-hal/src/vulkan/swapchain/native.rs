@@ -9,7 +9,9 @@ use parking_lot::{Mutex, MutexGuard};
 use crate::vulkan::{
     conv, map_host_device_oom_and_lost_err,
     semaphore_list::SemaphoreType,
-    swapchain::{Surface, SurfaceTextureMetadata, Swapchain, SwapchainSubmissionSemaphoreGuard},
+    swapchain::{
+        Surface, SurfaceTextureMetadata, Swapchain, SwapchainSubmissionSemaphoreGuard, WindowHandle,
+    },
     swapchain_provider_callbacks, DeviceShared, InstanceShared, SwapchainProviderCallbacks,
 };
 
@@ -17,15 +19,27 @@ pub(crate) struct NativeSurface {
     raw: vk::SurfaceKHR,
     functor: khr::surface::Instance,
     instance: Arc<InstanceShared>,
+    /// Built from the window's `HWND` (Windows only) to answer the display-HDR
+    /// query; `None` for non-Win32 surfaces.
+    #[cfg(windows)]
+    hdr_source: Option<crate::auxil::dxgi::hdr::DxgiHdrSource>,
 }
 
 impl NativeSurface {
-    pub fn from_vk_surface_khr(instance: &crate::vulkan::Instance, raw: vk::SurfaceKHR) -> Self {
+    pub fn from_vk_surface_khr(
+        instance: &crate::vulkan::Instance,
+        raw: vk::SurfaceKHR,
+        hwnd: Option<WindowHandle>,
+    ) -> Self {
+        #[cfg(not(windows))]
+        let _ = hwnd;
         let functor = khr::surface::Instance::new(&instance.shared.entry, &instance.shared.raw);
         Self {
             raw,
             functor,
             instance: Arc::clone(&instance.shared),
+            #[cfg(windows)]
+            hdr_source: hwnd.map(|wh| crate::auxil::dxgi::hdr::DxgiHdrSource::new(wh.0)),
         }
     }
 
@@ -34,13 +48,15 @@ impl NativeSurface {
     }
 }
 
-impl Surface for NativeSurface {
-    unsafe fn delete_surface(self: Box<Self>) {
+impl Drop for NativeSurface {
+    fn drop(&mut self) {
         unsafe {
             self.functor.destroy_surface(self.raw, None);
         }
     }
+}
 
+impl Surface for NativeSurface {
     fn surface_capabilities(
         &self,
         adapter: &crate::vulkan::Adapter,
@@ -130,11 +146,23 @@ impl Surface for NativeSurface {
             }
         };
 
-        let mut formats = raw_surface_formats
+        // Group the driver's (format, color space) pairs into one entry per
+        // format, preserving the driver's format order.
+        let mut formats: Vec<wgt::SurfaceFormatCapabilities> = Vec::new();
+        for (format, color_space) in raw_surface_formats
             .into_iter()
             .filter_map(conv::map_vk_surface_formats)
-            .collect();
-        crate::vulkan::surface_formats::apply(&mut formats); // DLSS-G不接受sRGB交换链；仅存在真实同通道UNORM候选时移除sRGB，默认和FSR完全不变。
+        {
+            let color_spaces = color_space.to_color_spaces().unwrap();
+            match formats.iter_mut().find(|fc| fc.format == format) {
+                Some(fc) => fc.color_spaces |= color_spaces,
+                None => formats.push(wgt::SurfaceFormatCapabilities {
+                    format,
+                    color_spaces,
+                }),
+            }
+        }
+        crate::vulkan::surface_formats::apply(&mut formats);
         Some(crate::SurfaceCapabilities {
             formats,
             // TODO: Right now we're always truncating the swap chain
@@ -161,35 +189,21 @@ impl Surface for NativeSurface {
         profiling::scope!("Device::create_swapchain");
         let functor = khr::swapchain::Device::new(&self.instance.raw, &device.shared.raw);
 
-        let (old_swapchain, old_provider) = match provided_old_swapchain {
-            Some(osc) => {
-                let old = osc.as_any().downcast_ref::<NativeSwapchain>().unwrap();
-                (old.raw, old.provider)
-            }
-            None => (vk::SwapchainKHR::null(), None),
-        };
+        let mut provided_old_swapchain = provided_old_swapchain;
+        if provided_old_swapchain.as_ref().is_some_and(|old| {
+            old.as_any().downcast_ref::<NativeSwapchain>().unwrap().provider.is_some()
+        }) {
+            // FSR 代理须先释放旧 SDK 交换链才能重建，统一经 Drop 走配对的销毁回调。
+            drop(provided_old_swapchain.take());
+        }
+        let old_swapchain_for_create = provided_old_swapchain
+            .as_ref()
+            .map(|old| old.as_any().downcast_ref::<NativeSwapchain>().unwrap().raw)
+            .unwrap_or(vk::SwapchainKHR::null());
         let requested_provider = swapchain_provider_callbacks()
             .filter(|provider| unsafe { (provider.is_available)() != 0 });
-        let old_swapchain_for_create = if let Some(provider) = old_provider {
-            unsafe {
-                (provider.destroy_swapchain)(
-                    device.shared.raw.handle(),
-                    old_swapchain,
-                    core::ptr::null(),
-                )
-            };
-            vk::SwapchainKHR::null()
-        } else {
-            old_swapchain
-        };
 
-        let color_space = if config.format == wgt::TextureFormat::Rgba16Float {
-            // Enable wide color gamut mode
-            // Vulkan swapchain for Android only supports DISPLAY_P3_NONLINEAR_EXT and EXTENDED_SRGB_LINEAR_EXT
-            vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT
-        } else {
-            vk::ColorSpaceKHR::SRGB_NONLINEAR
-        };
+        let color_space = conv::map_surface_color_space(config.color_space);
 
         let original_format = device.shared.private_caps.map_texture_format(config.format);
         let mut raw_flags = vk::SwapchainCreateFlagsKHR::empty();
@@ -264,11 +278,6 @@ impl Surface for NativeSurface {
             (unsafe { functor.create_swapchain(&info, None) }, None)
         };
 
-        // doing this before bailing out with error
-        if old_provider.is_none() && old_swapchain != vk::SwapchainKHR::null() {
-            unsafe { functor.destroy_swapchain(old_swapchain, None) }
-        }
-
         let raw = match result {
             Ok(swapchain) => swapchain,
             Err(error) => {
@@ -293,12 +302,21 @@ impl Surface for NativeSurface {
         }
         .map_err(crate::vulkan::map_host_device_oom_err)?;
 
-        let fence = unsafe {
-            device
-                .shared
-                .raw
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .map_err(crate::vulkan::map_host_device_oom_err)?
+        // This fence is only used to throttle acquisition on Windows. It is very important to
+        // avoid bad frame pacing when the Vulkan driver is using a DXGI swapchain. See
+        // https://github.com/gfx-rs/wgpu/issues/8310 and
+        // https://github.com/gfx-rs/wgpu/issues/8354 for more details.
+        let fence = if cfg!(target_os = "windows") {
+            let raw = unsafe {
+                device
+                    .shared
+                    .raw
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .map_err(crate::vulkan::map_host_device_oom_err)?
+            };
+            Some(raw)
+        } else {
+            None
         };
 
         // NOTE: It's important that we define the same number of acquire/present semaphores
@@ -328,6 +346,11 @@ impl Surface for NativeSurface {
             present_semaphores,
             next_present_time: None,
         }))
+    }
+
+    #[cfg(windows)]
+    fn display_hdr_info(&self) -> Option<wgt::DisplayHdrInfo> {
+        self.hdr_source.as_ref()?.display_hdr_info()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -371,7 +394,7 @@ pub(crate) struct NativeSwapchain {
     device: Arc<DeviceShared>,
     images: Vec<vk::Image>,
     /// Fence used to wait on the acquired image.
-    fence: vk::Fence,
+    fence: Option<vk::Fence>,
     config: crate::SurfaceConfiguration,
 
     /// Semaphores used between image acquisition and the first submission
@@ -420,13 +443,29 @@ pub(crate) struct NativeSwapchain {
     next_present_time: Option<vk::PresentTimeGOOGLE>,
 }
 
+impl Drop for NativeSwapchain {
+    fn drop(&mut self) {
+        // release_resources 已先关闭生成并等待，句柄按创建它的实现配对销毁。
+        match self.provider {
+            Some(provider) => unsafe {
+                (provider.destroy_swapchain)(
+                    self.device.raw.handle(),
+                    self.raw,
+                    core::ptr::null(),
+                )
+            },
+            None => unsafe { self.functor.destroy_swapchain(self.raw, None) },
+        }
+    }
+}
+
 impl Swapchain for NativeSwapchain {
     unsafe fn release_resources(&mut self, device: &crate::vulkan::Device) {
         profiling::scope!("Swapchain::release_resources");
         // 【FSR 生命周期契约】vkDeviceWaitIdle 要求全部队列外部同步，必须先停止代理的后台 Present 线程。
         if let Some(provider) = self.provider { // 普通 Vulkan 交换链不引入新的生命周期操作。
             unsafe { (provider.quiesce_swapchain)() }; // 先禁用生成并排空工作，再等待设备及释放 wgpu 同步对象。
-        } // 代理停止边界结束；销毁句柄仍由原来的 delete_swapchain 配对完成。
+        } // 代理停止边界结束；句柄由 Drop 按创建者配对销毁。
         {
             profiling::scope!("vkDeviceWaitIdle");
             // We need to also wait until all presentation work is done. Because there is no way to portably wait until
@@ -440,7 +479,9 @@ impl Swapchain for NativeSwapchain {
             };
         };
 
-        unsafe { device.shared.raw.destroy_fence(self.fence, None) }
+        if let Some(fence) = self.fence {
+            unsafe { device.shared.raw.destroy_fence(fence, None) }
+        }
 
         // We cannot take this by value, as the function returns `self`.
         for semaphore in self.acquire_semaphores.drain(..) {
@@ -459,19 +500,6 @@ impl Swapchain for NativeSwapchain {
             let mutex_removed = arc_removed.into_inner();
 
             unsafe { mutex_removed.destroy(&device.shared.raw) };
-        }
-    }
-
-    unsafe fn delete_swapchain(self: Box<Self>) {
-        match self.provider {
-            Some(provider) => unsafe {
-                (provider.destroy_swapchain)(
-                    self.device.raw.handle(),
-                    self.raw,
-                    core::ptr::null(),
-                )
-            },
-            None => unsafe { self.functor.destroy_swapchain(self.raw, None) },
         }
     }
 
@@ -517,11 +545,16 @@ impl Swapchain for NativeSwapchain {
         // thus waited for `locked_swapchain_semaphores.acquire`, wait for all
         // of them to finish, thus ensuring that it's okay to pass `acquire` to
         // `vkAcquireNextImageKHR` again.
-        self.device.wait_for_fence(
+        let completed = self.device.wait_for_fence(
             fence,
             acquire_semaphore_guard.previously_used_submission_index,
             timeout_ns,
         )?;
+        if !completed {
+            return Err(crate::SurfaceError::Timeout);
+        }
+
+        let acquire_fence = self.fence.unwrap_or_else(vk::Fence::null);
 
         // will block if no image is available
         let acquired = match self.provider {
@@ -534,7 +567,7 @@ impl Swapchain for NativeSwapchain {
                         self.raw,
                         timeout_ns,
                         acquire_semaphore_guard.acquire,
-                        self.fence,
+                        acquire_fence,
                         &mut index,
                     )
                 };
@@ -550,7 +583,7 @@ impl Swapchain for NativeSwapchain {
                     self.raw,
                     timeout_ns,
                     acquire_semaphore_guard.acquire,
-                    self.fence,
+                    acquire_fence,
                 )
             },
         };
@@ -575,27 +608,19 @@ impl Swapchain for NativeSwapchain {
             }
         };
 
-        // Wait for the image was acquired to be fully ready to be rendered too.
-        //
-        // This wait is very important on Windows to avoid bad frame pacing on
-        // Windows where the Vulkan driver is using a DXGI swapchain. See
-        // https://github.com/gfx-rs/wgpu/issues/8310 and
-        // https://github.com/gfx-rs/wgpu/issues/8354 for more details.
-        //
-        // On other platforms, this wait may serve to slightly decrease frame
-        // latency, depending on how the platform implements waiting within
-        // acquire.
-        unsafe {
-            // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
-            self.device
-                .raw
-                .wait_for_fences(&[self.fence], true, timeout_ns)
-                .map_err(map_host_device_oom_and_lost_err)?;
+        if let Some(fence) = self.fence {
+            unsafe {
+                // The `wait_all` argument must be `true` to avoid crash on some Android devices. See https://github.com/gfx-rs/wgpu/pull/8769
+                self.device
+                    .raw
+                    .wait_for_fences(&[fence], true, timeout_ns)
+                    .map_err(map_host_device_oom_and_lost_err)?;
 
-            self.device
-                .raw
-                .reset_fences(&[self.fence])
-                .map_err(map_host_device_oom_and_lost_err)?;
+                self.device
+                    .raw
+                    .reset_fences(&[fence])
+                    .map_err(map_host_device_oom_and_lost_err)?;
+            }
         }
 
         drop(acquire_semaphore_guard);

@@ -7,7 +7,7 @@ use crate::{
         solver::{
             SolverConfig,
             schedule::SubstepSolverSystems,
-            solver_body::{SolverBody, SolverBodyInertia},
+            solver_body::{SolverBodies, SolverBody, SolverBodyIndex, SolverBodyInertia},
             xpbd::{XpbdConstraint, XpbdConstraintSolverData},
         },
     },
@@ -20,6 +20,8 @@ pub struct XpbdSolverPlugin;
 
 impl Plugin for XpbdSolverPlugin {
     fn build(&self, app: &mut App) {
+        app.register_type::<XpbdVelocityProjection>();
+
         app.register_required_components::<FixedJoint, FixedJointSolverData>();
         app.register_required_components::<RevoluteJoint, RevoluteJointSolverData>();
         #[cfg(feature = "3d")]
@@ -74,22 +76,7 @@ impl Plugin for XpbdSolverPlugin {
         app.add_systems(
             SubstepSchedule,
             (
-                |mut query: Query<
-                    (
-                        &SolverBody,
-                        &mut PreSolveDeltaPosition,
-                        &mut PreSolveDeltaRotation,
-                    ),
-                    Without<RigidBodyDisabled>,
-                >| {
-                    for (body, mut pre_solve_delta_position, mut pre_solve_delta_rotation) in
-                        &mut query
-                    {
-                        // Store the previous delta translation and rotation for XPBD velocity updates.
-                        pre_solve_delta_position.0 = body.delta_position;
-                        pre_solve_delta_rotation.0 = body.delta_rotation;
-                    }
-                },
+                store_pre_solve_deltas,
                 solve_xpbd_joint::<FixedJoint>,
                 solve_xpbd_joint::<RevoluteJoint>,
                 #[cfg(feature = "3d")]
@@ -137,6 +124,22 @@ pub enum XpbdSolverSystems {
     VelocityProjection,
 }
 
+/// A marker component for [rigid bodies](RigidBody) whose velocities should be projected
+/// from the position corrections applied by XPBD constraints.
+///
+/// The XPBD solver only stores pre-solve deltas and projects velocities for bodies with this
+/// component, so bodies that no XPBD constraint touches are skipped entirely.
+///
+/// This is inserted and removed automatically for the bodies of joints in the [`JointGraph`].
+/// If you implement a [custom XPBD constraint](crate::dynamics::solver::xpbd#custom-constraints)
+/// that is not registered in the joint graph, insert this component on the participating bodies
+/// yourself, or the constraint will have no effect on their velocities.
+///
+/// [`JointGraph`]: crate::dynamics::joints::joint_graph::JointGraph
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Reflect)]
+#[reflect(Component, Debug, Default, PartialEq)]
+pub struct XpbdVelocityProjection;
+
 /// Iterates through the XPBD joints of a given type and solves them.
 pub fn prepare_xpbd_joint<
     C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
@@ -161,13 +164,16 @@ pub fn prepare_xpbd_joint<
 pub fn solve_xpbd_joint<
     C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
 >(
-    bodies: Query<(&mut SolverBody, &SolverBodyInertia), Without<RigidBodyDisabled>>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    index_query: Query<&SolverBodyIndex, Without<RigidBodyDisabled>>,
     mut joints: Query<(&mut C, &mut C::SolverData), (Without<RigidBody>, Without<JointDisabled>)>,
     time: Res<Time>,
 ) where
     C::SolverData: Component<Mutability = Mutable>,
 {
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
+
+    let access = solver_bodies.access();
 
     let mut dummy_body1 = SolverBody::default();
     let mut dummy_body2 = SolverBody::default();
@@ -175,16 +181,32 @@ pub fn solve_xpbd_joint<
     for (mut joint, mut solver_data) in &mut joints {
         let [entity1, entity2] = joint.entities();
 
+        let index1 = index_query
+            .get(entity1)
+            .copied()
+            .unwrap_or(SolverBodyIndex::INVALID);
+        let index2 = index_query
+            .get(entity2)
+            .copied()
+            .unwrap_or(SolverBodyIndex::INVALID);
+
+        if index1 == index2 {
+            continue;
+        }
+
         let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
         let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
 
-        // Get the solver bodies for the two colliding entities.
-        if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(entity1) } {
-            body1 = body.into_inner();
+        // Get the solver bodies for the two jointed bodies.
+        //
+        // SAFETY: The two jointed bodies are distinct, and joints are processed serially here.
+        let (b1, b2) = unsafe { access.get_pair_unchecked_mut(index1, index2) };
+        if let Some((body, inertia)) = b1 {
+            body1 = body;
             inertia1 = inertia;
         }
-        if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(entity2) } {
-            body2 = body.into_inner();
+        if let Some((body, inertia)) = b2 {
+            body2 = body;
             inertia2 = inertia;
         }
 
@@ -211,14 +233,17 @@ pub fn solve_xpbd_joint<
 pub fn warm_start_xpbd_motors<
     C: Component<Mutability = Mutable> + EntityConstraint<2> + XpbdConstraint<2>,
 >(
-    bodies: Query<(&mut SolverBody, &SolverBodyInertia), Without<RigidBodyDisabled>>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    index_query: Query<&SolverBodyIndex, Without<RigidBodyDisabled>>,
     mut joints: Query<(&C, &mut C::SolverData), (Without<RigidBody>, Without<JointDisabled>)>,
     time: Res<Time>,
     solver_config: Res<SolverConfig>,
 ) where
     C::SolverData: Component<Mutability = Mutable>,
 {
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
+
+    let access = solver_bodies.access();
 
     let mut dummy_body1 = SolverBody::default();
     let mut dummy_body2 = SolverBody::default();
@@ -226,15 +251,30 @@ pub fn warm_start_xpbd_motors<
     for (joint, mut solver_data) in &mut joints {
         let [entity1, entity2] = joint.entities();
 
+        let index1 = index_query
+            .get(entity1)
+            .copied()
+            .unwrap_or(SolverBodyIndex::INVALID);
+        let index2 = index_query
+            .get(entity2)
+            .copied()
+            .unwrap_or(SolverBodyIndex::INVALID);
+
+        if index1 == index2 {
+            continue;
+        }
+
         let (mut body1, mut inertia1) = (&mut dummy_body1, &SolverBodyInertia::DUMMY);
         let (mut body2, mut inertia2) = (&mut dummy_body2, &SolverBodyInertia::DUMMY);
 
-        if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(entity1) } {
-            body1 = body.into_inner();
+        // SAFETY: The two jointed bodies are distinct, and joints are processed serially here.
+        let (b1, b2) = unsafe { access.get_pair_unchecked_mut(index1, index2) };
+        if let Some((body, inertia)) = b1 {
+            body1 = body;
             inertia1 = inertia;
         }
-        if let Ok((body, inertia)) = unsafe { bodies.get_unchecked(entity2) } {
-            body2 = body.into_inner();
+        if let Some((body, inertia)) = b2 {
+            body2 = body;
             inertia2 = inertia;
         }
 
@@ -255,14 +295,43 @@ pub fn warm_start_xpbd_motors<
     }
 }
 
+/// Stores the delta position and rotation of each body before XPBD constraints are solved.
+fn store_pre_solve_deltas(
+    solver_bodies: Res<SolverBodies>,
+    mut query: Query<
+        (
+            &SolverBodyIndex,
+            &mut PreSolveDeltaPosition,
+            &mut PreSolveDeltaRotation,
+        ),
+        (With<XpbdVelocityProjection>, Without<RigidBodyDisabled>),
+    >,
+) {
+    for (index, mut pre_solve_delta_position, mut pre_solve_delta_rotation) in &mut query {
+        let Some(body) = solver_bodies.get(*index) else {
+            continue;
+        };
+        pre_solve_delta_position.0 = body.delta_position;
+        pre_solve_delta_rotation.0 = body.delta_rotation;
+    }
+}
+
 /// Updates the linear velocity of all dynamic bodies based on the change in position from the XPBD solver.
 fn project_linear_velocity(
-    mut bodies: Query<(&mut SolverBody, &PreSolveDeltaPosition), RigidBodyActiveFilter>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    bodies: Query<
+        (&SolverBodyIndex, &PreSolveDeltaPosition),
+        (With<XpbdVelocityProjection>, RigidBodyActiveFilter),
+    >,
     time: Res<Time>,
 ) {
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
 
-    for (mut body, pre_solve_delta_pos) in &mut bodies {
+    let access = solver_bodies.access();
+
+    for (index, pre_solve_delta_pos) in &bodies {
+        // SAFETY: Each entity has a unique solver body index, so the accessed bodies are disjoint.
+        let body = unsafe { access.body_unchecked_mut(*index) };
         // v = (x - x_prev) / h
         let new_lin_vel = (body.delta_position - pre_solve_delta_pos.0) / delta_secs;
         body.linear_velocity += new_lin_vel;
@@ -272,13 +341,21 @@ fn project_linear_velocity(
 /// Updates the angular velocity of all dynamic bodies based on the change in rotation from the XPBD solver.
 #[cfg(feature = "2d")]
 fn project_angular_velocity(
-    mut bodies: Query<(&mut SolverBody, &PreSolveDeltaRotation), RigidBodyActiveFilter>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    bodies: Query<
+        (&SolverBodyIndex, &PreSolveDeltaRotation),
+        (With<XpbdVelocityProjection>, RigidBodyActiveFilter),
+    >,
     time: Res<Time>,
 ) {
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
 
-    for (mut body, pre_solve_delta_rot) in &mut bodies {
-        let new_ang_vel = pre_solve_delta_rot.angle_between(body.delta_rotation) / delta_secs;
+    let access = solver_bodies.access();
+
+    for (index, pre_solve_delta_rot) in &bodies {
+        // SAFETY: Each entity has a unique solver body index, so the accessed bodies are disjoint.
+        let body = unsafe { access.body_unchecked_mut(*index) };
+        let new_ang_vel = pre_solve_delta_rot.angle_to(body.delta_rotation) / delta_secs;
         body.angular_velocity += new_ang_vel;
     }
 }
@@ -286,15 +363,21 @@ fn project_angular_velocity(
 /// Updates the angular velocity of all dynamic bodies based on the change in rotation from the XPBD solver.
 #[cfg(feature = "3d")]
 fn project_angular_velocity(
-    mut bodies: Query<(&mut SolverBody, &PreSolveDeltaRotation), RigidBodyActiveFilter>,
+    mut solver_bodies: ResMut<SolverBodies>,
+    bodies: Query<
+        (&SolverBodyIndex, &PreSolveDeltaRotation),
+        (With<XpbdVelocityProjection>, RigidBodyActiveFilter),
+    >,
     time: Res<Time>,
 ) {
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
 
-    for (mut body, pre_solve_delta_rot) in &mut bodies {
-        let delta_rot = body
-            .delta_rotation
-            .mul_quat(pre_solve_delta_rot.inverse().0);
+    let access = solver_bodies.access();
+
+    for (index, pre_solve_delta_rot) in &bodies {
+        // SAFETY: Each entity has a unique solver body index, so the accessed bodies are disjoint.
+        let body = unsafe { access.body_unchecked_mut(*index) };
+        let delta_rot = body.delta_rotation.mul_quat(pre_solve_delta_rot.inverse());
 
         let mut new_ang_vel = 2.0 * delta_rot.xyz() / delta_secs;
 
@@ -313,12 +396,12 @@ fn writeback_joint_forces<C: Component + EntityConstraint<2> + XpbdConstraint<2>
 ) where
     C::SolverData: Component<Mutability = Mutable>,
 {
-    let delta_secs = time.delta_seconds_adjusted();
+    let delta_secs = time.delta_secs();
 
     // Detailed Rigid Body Simulation with Extended Position Based Dynamics by Müller et al.
     // states that  `f = λ * n / h²`. However, with substepping, it seems that we need to accumulate
     // Lagrange multipliers across substeps, and use the formula `f = λ * n / dt^2 * substep_count`.
-    let rhs = (delta_secs * delta_secs).recip_or_zero() * substep_count.0 as Scalar;
+    let rhs = (delta_secs * delta_secs).recip_or_zero() * substep_count.0 as f32;
 
     for (solver_data, mut forces) in &mut joints {
         forces.set_force(solver_data.total_position_lagrange() * rhs);

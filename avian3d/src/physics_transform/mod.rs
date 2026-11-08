@@ -3,9 +3,9 @@
 //! See [`PhysicsTransformPlugin`].
 
 mod transform;
-pub use transform::{Position, PreSolveDeltaPosition, PreSolveDeltaRotation, Rotation};
 #[allow(unused_imports)]
-pub(crate) use transform::{RotationValue, init_physics_transform};
+pub(crate) use transform::init_physics_transform;
+pub use transform::{Position, PreSolveDeltaPosition, PreSolveDeltaRotation, Rotation};
 
 mod helper;
 pub use helper::PhysicsTransformHelper;
@@ -16,12 +16,14 @@ mod tests;
 use crate::{
     prelude::*,
     schedule::{LastPhysicsTick, is_changed_after_tick},
+    utils::{MIN_PAR_ITER_ENTITIES, ParallelQueryForEach},
 };
 use approx::AbsDiffEq;
 use bevy::{
     ecs::{
         change_detection::Tick, intern::Interned, schedule::ScheduleLabel, system::SystemChangeTick,
     },
+    math::Affine3A,
     prelude::*,
     transform::systems::{mark_dirty_trees, propagate_parent_transforms, sync_simple_transforms},
 };
@@ -185,7 +187,7 @@ pub type PhysicsTransformSet = PhysicsTransformSystems;
 /// To account for hierarchies, transform propagation should be run before this system.
 #[allow(clippy::type_complexity)]
 pub fn transform_to_position(
-    mut query: Query<(&GlobalTransform, &mut Position, &mut Rotation)>,
+    mut query: Query<(Ref<GlobalTransform>, &mut Position, &mut Rotation)>,
     length_unit: Res<PhysicsLengthUnit>,
     last_physics_tick: Res<LastPhysicsTick>,
     system_tick: SystemChangeTick,
@@ -200,39 +202,104 @@ pub fn transform_to_position(
     };
 
     // If the `GlobalTransform` translation and `Position` differ by less than 0.01 mm, we ignore the change.
-    let distance_tolerance = length_unit.0 * 1e-5;
-    // If the `GlobalTransform` rotation and `Rotation` differ by less than 0.1 degrees, we ignore the change.
-    let rotation_tolerance = (0.1 as Scalar).to_radians();
+    let distance_tolerance = length_unit.real() * 1e-5;
 
-    for (global_transform, mut position, mut rotation) in &mut query {
-        let global_transform = global_transform.compute_transform();
-        #[cfg(feature = "2d")]
-        let transform_translation = global_transform.translation.truncate().adjust_precision();
-        #[cfg(feature = "3d")]
-        let transform_translation = global_transform.translation.adjust_precision();
-        let transform_rotation = Rotation::from(global_transform.rotation.adjust_precision());
+    let last_physics_tick = last_physics_tick.0;
 
-        let position_changed = !position.is_added()
-            && is_changed_after_tick(
-                Ref::from(position.reborrow()),
-                last_physics_tick.0,
-                this_run,
-            );
-        if !position_changed && position.abs_diff_ne(&transform_translation, distance_tolerance) {
-            position.0 = transform_translation;
+    query.par_for_each_mut(
+        MIN_PAR_ITER_ENTITIES,
+        |(global_transform, mut position, mut rotation)| {
+            let transform_changed = global_transform.is_added()
+                || is_changed_after_tick(global_transform, last_physics_tick, this_run);
+            if !transform_changed {
+                return;
+            }
+
+            let affine = global_transform.affine();
+
+            let position_changed = !position.is_added()
+                && is_changed_after_tick(
+                    Ref::from(position.reborrow()),
+                    last_physics_tick,
+                    this_run,
+                );
+            if !position_changed {
+                #[cfg(feature = "2d")]
+                let transform_translation = affine.translation.truncate().real();
+                #[cfg(feature = "3d")]
+                let transform_translation = Vec3::from(affine.translation).real();
+
+                if position.abs_diff_ne(&transform_translation, distance_tolerance) {
+                    position.0 = transform_translation;
+                }
+            }
+
+            let rotation_changed = !rotation.is_added()
+                && is_changed_after_tick(
+                    Ref::from(rotation.reborrow()),
+                    last_physics_tick,
+                    this_run,
+                );
+            if !rotation_changed {
+                let transform_rotation = rotation_from_affine(&affine);
+                // The rotations differ by more than the tolerance if the cosine of the angle
+                // between them is smaller than the cosine of the tolerance angle.
+                if cos_angle_between(*rotation, transform_rotation) < ROTATION_COS_TOLERANCE {
+                    *rotation = transform_rotation;
+                }
+            }
+        },
+    );
+}
+
+/// The cosine of the angle below which a difference between the `GlobalTransform` rotation
+/// and [`Rotation`] is ignored. This corresponds to an angle of 0.1 degrees.
+const ROTATION_COS_TOLERANCE: f32 = 0.999_998_5;
+
+/// Returns the cosine of the angle between two rotations.
+///
+/// This is a cheaper alternative to `Rotation::angle_between`,
+/// as it avoids inverse trigonometric functions.
+#[inline]
+fn cos_angle_between(a: Rotation, b: Rotation) -> f32 {
+    #[cfg(feature = "2d")]
+    {
+        a.cos * b.cos + a.sin * b.sin
+    }
+    #[cfg(feature = "3d")]
+    {
+        // The angle between two unit quaternions is `2 * acos(|dot|)`,
+        // and `cos(2 * acos(x)) == 2 * x^2 - 1`.
+        let dot = a.dot(b.0);
+        2.0 * dot * dot - 1.0
+    }
+}
+
+/// Extracts the [`Rotation`] from the affine transform of a `GlobalTransform`.
+///
+/// This is equivalent to `Rotation::from(global_transform.compute_transform().rotation)`,
+/// but avoids the full scale-rotation-translation decomposition, which is comparatively expensive.
+#[inline]
+fn rotation_from_affine(affine: &Affine3A) -> Rotation {
+    let mat = affine.matrix3;
+
+    let det_sign = mat.determinant().signum();
+
+    #[cfg(feature = "2d")]
+    {
+        let x_axis = Vec2::new(mat.x_axis.x, mat.x_axis.y) * det_sign;
+        let x_axis = x_axis.normalize_or(Vec2::X);
+        Rotation {
+            cos: x_axis.x,
+            sin: x_axis.y,
         }
-
-        let rotation_changed = !rotation.is_added()
-            && is_changed_after_tick(
-                Ref::from(rotation.reborrow()),
-                last_physics_tick.0,
-                this_run,
-            );
-        if !rotation_changed
-            && rotation.angle_between(transform_rotation).abs() > rotation_tolerance
-        {
-            *rotation = transform_rotation;
-        }
+    }
+    #[cfg(feature = "3d")]
+    {
+        let x_axis = (mat.x_axis * det_sign).normalize_or(Vec3A::X);
+        let y_axis = mat.y_axis.normalize_or(Vec3A::Y);
+        let z_axis = mat.z_axis.normalize_or(Vec3A::Z);
+        Rotation(Quat::from_mat3a(&Mat3A::from_cols(x_axis, y_axis, z_axis)))
     }
 }
 
@@ -280,9 +347,8 @@ pub fn position_to_transform(
                 let parent_pos = parent_pos.map_or(parent_transform.translation, |pos| {
                     pos.f32().extend(parent_transform.translation.z)
                 });
-                let parent_rot = parent_rot.map_or(parent_transform.rotation, |rot| {
-                    Quaternion::from(*rot).f32()
-                });
+                let parent_rot =
+                    parent_rot.map_or(parent_transform.rotation, |rot| Quat::from(*rot));
                 let parent_scale = parent_transform.scale;
                 let parent_transform = Transform::from_translation(parent_pos)
                     .with_rotation(parent_rot)
@@ -295,7 +361,7 @@ pub fn position_to_transform(
                         pos.f32()
                             .extend(parent_pos.z + transform.translation.z * parent_scale.z),
                     )
-                    .with_rotation(Quaternion::from(*rot).f32()),
+                    .with_rotation(Quat::from(*rot)),
                 )
                 .reparented_to(&GlobalTransform::from(parent_transform));
 
@@ -304,7 +370,7 @@ pub fn position_to_transform(
             }
         } else {
             transform.translation = pos.f32().extend(transform.translation.z);
-            transform.rotation = Quaternion::from(*rot).f32();
+            transform.rotation = Quat::from(*rot);
         }
     }
 }
@@ -325,7 +391,7 @@ pub fn position_to_transform(
                 // Compute the global transform of the parent using its Position and Rotation
                 let parent_transform = parent_transform.compute_transform();
                 let parent_pos = parent_pos.map_or(parent_transform.translation, |pos| pos.f32());
-                let parent_rot = parent_rot.map_or(parent_transform.rotation, |rot| rot.f32());
+                let parent_rot = parent_rot.map_or(parent_transform.rotation, |rot| rot.0);
                 let parent_scale = parent_transform.scale;
                 let parent_transform = Transform::from_translation(parent_pos)
                     .with_rotation(parent_rot)
@@ -334,7 +400,7 @@ pub fn position_to_transform(
                 // The new local transform of the child body,
                 // computed from the its global transform and its parents global transform
                 let new_transform = GlobalTransform::from(
-                    Transform::from_translation(pos.f32()).with_rotation(rot.f32()),
+                    Transform::from_translation(pos.f32()).with_rotation(rot.0),
                 )
                 .reparented_to(&GlobalTransform::from(parent_transform));
 
@@ -343,7 +409,7 @@ pub fn position_to_transform(
             }
         } else {
             transform.translation = pos.f32();
-            transform.rotation = rot.f32();
+            transform.rotation = rot.0;
         }
     }
 }

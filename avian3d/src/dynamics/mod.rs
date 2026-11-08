@@ -71,10 +71,10 @@ pub mod solver;
 pub mod prelude {
     pub(crate) use super::rigid_body::mass_properties::{ComputeMassProperties, MassProperties};
     #[cfg(feature = "xpbd_joints")]
-    pub use super::solver::xpbd::XpbdSolverPlugin;
+    pub use super::solver::xpbd::{XpbdSolverPlugin, XpbdVelocityProjection};
     #[expect(deprecated)]
     pub use super::{
-        ccd::{CcdPlugin, SpeculativeMargin, SweepMode, SweptCcd},
+        ccd::{CcdFilter, CcdPlugin, SpeculativeCcd, SweepMode, SweptCcd},
         integrator::{
             CustomPositionIntegration, CustomVelocityIntegration, Gravity, IntegratorPlugin,
         },
@@ -82,8 +82,10 @@ pub mod prelude {
             AngleLimit, AngularMotor, DistanceJoint, DistanceLimit, FixedJoint, JointAnchor,
             JointBasis, JointCollisionDisabled, JointDamping, JointDisabled, JointForces,
             JointFrame, JointPlugin, LinearMotor, MotorModel, PrismaticJoint, RevoluteJoint,
+            joint_graph::JointGraph,
         },
         rigid_body::{
+            body_size_metrics::{BodySizeMetrics, BodySizeMetricsPlugin},
             forces::{
                 ConstantAngularAcceleration, ConstantForce, ConstantLinearAcceleration,
                 ConstantLocalForce, ConstantLocalLinearAcceleration, ConstantTorque, ForcePlugin,
