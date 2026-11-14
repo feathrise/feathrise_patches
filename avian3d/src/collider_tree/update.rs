@@ -125,7 +125,7 @@ impl<C: AnyCollider> Plugin for ColliderTreeUpdatePlugin<C> {
         // 8. On remove `Sensor`, unset sensor proxy flag.
         // 9. On insert `CollisionLayers`, update proxy layers.
         // 10. On insert `ActiveCollisionHooks`, set proxy flag.
-        // 11. On replace `RigidBodyDisabled`, set/unset proxy flag.
+        // 11. On insert/remove `RigidBodyDisabled`, set/unset proxy flag.
 
         // Case 1
         app.add_observer(add_to_tree_on::<Insert<(C, ColliderOf)>, Without<ColliderDisabled>>);
@@ -380,33 +380,48 @@ impl<C: AnyCollider> Plugin for ColliderTreeUpdatePlugin<C> {
         );
 
         // Case 11
-        app.add_observer(
-            |trigger: On<Discard<RigidBodyDisabled>>,
-             body_query: Query<(&RigidBodyColliders, Has<RigidBodyDisabled>)>,
-             mut collider_query: Query<&ColliderTreeProxyKey, Without<ColliderDisabled>>,
-             mut trees: ResMut<ColliderTrees>| {
-                let entity = trigger.entity;
+        app.add_observer(update_body_disabled_on::<Insert<RigidBodyDisabled>, true>);
+        app.add_observer(update_body_disabled_on::<Remove<RigidBodyDisabled>, false>);
+    }
+}
 
-                let Ok((body_colliders, is_body_disabled)) = body_query.get(entity) else {
-                    return;
-                };
+fn update_body_disabled_on<E: EventPattern<Event: EntityEvent>, const IS_DISABLED: bool>(
+    trigger: On<E>,
+    body_query: Query<&RigidBodyColliders>,
+    collider_query: Query<&ColliderTreeProxyKey, Without<ColliderDisabled>>,
+    mut trees: ResMut<ColliderTrees>,
+    mut moved_proxies: ResMut<MovedProxies>,
+) {
+    let body = trigger.event_target();
+    let Ok(body_colliders) = body_query.get(body) else {
+        return;
+    };
 
-                for collider_entity in body_colliders.iter() {
-                    let Ok(proxy_key) = collider_query.get_mut(collider_entity) else {
-                        continue;
-                    };
+    // Discard/Remove执行时旧组件仍可查询；启用状态必须来自事件语义，不能读取Has。
+    // Insert也覆盖重复写入禁用标记，避免替换组件时错误地重新启用碰撞。
+    for collider in body_colliders.iter() {
+        let Ok(&proxy_key) = collider_query.get(collider) else {
+            continue;
+        };
+        if proxy_key == ColliderTreeProxyKey::PLACEHOLDER {
+            continue;
+        }
+        let tree = trees.tree_for_type_mut(proxy_key.tree_type());
+        let Some(proxy) = tree.get_proxy_mut(proxy_key.id()) else {
+            continue;
+        };
+        if proxy.collider != collider || proxy.body != Some(body) {
+            continue;
+        }
+        proxy
+            .flags
+            .set(ColliderTreeProxyFlags::BODY_DISABLED, IS_DISABLED);
 
-                    let tree = trees.tree_for_type_mut(proxy_key.tree_type());
-
-                    // Update body disabled flag.
-                    if let Some(proxy) = tree.get_proxy_mut(proxy_key.id()) {
-                        proxy
-                            .flags
-                            .set(ColliderTreeProxyFlags::BODY_DISABLED, is_body_disabled);
-                    }
-                }
-            },
-        );
+        // 窄相位在重新启用时清除旧接触。静止代理没有AABB变化，必须用现有两份
+        // moved索引安排一次重检测；只访问该刚体的碰撞器，并通过全局索引去重。
+        if !IS_DISABLED && moved_proxies.insert(proxy_key) {
+            tree.moved_proxies.push(proxy_key.id());
+        }
     }
 }
 
